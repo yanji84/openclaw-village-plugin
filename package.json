@@ -1,0 +1,8 @@
+{
+  "name": "openclaw-plugin-village",
+  "version": "1.0.0",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.js"]
+  }
+}
