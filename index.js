@@ -262,9 +262,9 @@ export default {
         }
 
         // Create Promise/resolver for this request
-        let resolveActions;
-        const actionsPromise = new Promise((r) => { resolveActions = r; });
-        pending.set(conversationId, { actions: [], resolve: resolveActions });
+        let resolveEntry;
+        const entryPromise = new Promise((r) => { resolveEntry = r; });
+        pending.set(conversationId, { actions: [], usage: null, resolve: resolveEntry });
 
         // Fire agent RPC (don't await — we await the Promise instead)
         const port = api.config?.gateway?.port;
@@ -294,7 +294,7 @@ export default {
           // Resolve pending if still waiting
           const entry = pending.get(conversationId);
           if (entry) {
-            entry.resolve(entry.actions);
+            entry.resolve(entry);
             pending.delete(conversationId);
           }
         });
@@ -303,23 +303,25 @@ export default {
         const timer = setTimeout(() => {
           const entry = pending.get(conversationId);
           if (entry) {
-            entry.resolve(entry.actions);
+            entry.resolve(entry);
             pending.delete(conversationId);
           }
         }, SCENE_TIMEOUT_MS);
 
         try {
-          const actions = await actionsPromise;
+          const entry = await entryPromise;
           clearTimeout(timer);
           pending.delete(conversationId);
 
           // Default to observe if no actions captured
-          const result = actions.length > 0
-            ? actions
+          const result = entry.actions.length > 0
+            ? entry.actions
             : [{ tool: "village_observe", params: {} }];
 
+          const responseObj = { actions: result };
+          if (entry.usage) responseObj.usage = entry.usage;
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ actions: result }));
+          res.end(JSON.stringify(responseObj));
         } catch (err) {
           clearTimeout(timer);
           pending.delete(conversationId);
@@ -490,7 +492,7 @@ export default {
 
     // --- Hook: agent_end — resolve pending if no actions captured ---
 
-    api.on("agent_end", (_event, ctx) => {
+    api.on("agent_end", (event, ctx) => {
       // No fallback to lastVillageSessionKey — if ctx.sessionKey is unavailable,
       // let SCENE_TIMEOUT_MS resolve with village_observe (safe default).
       const sessionKey = ctx?.sessionKey;
@@ -501,7 +503,15 @@ export default {
 
       const entry = pending.get(nonce);
       if (entry) {
-        entry.resolve(entry.actions);
+        // Extract usage from the last assistant message in the agent run
+        const messages = event?.messages;
+        if (Array.isArray(messages)) {
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const u = messages[i]?.usage || messages[i]?.message?.usage;
+            if (u?.cost) { entry.usage = u; break; }
+          }
+        }
+        entry.resolve(entry);
         pending.delete(nonce);
       }
     });
