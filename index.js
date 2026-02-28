@@ -72,8 +72,8 @@ export default {
     ]);
     const MAX_ACTIONS_PER_TURN = 2;
     const MAX_MESSAGE_LENGTH = 500;
-    const SCENE_TIMEOUT_MS = 55_000;
-    const RPC_TIMEOUT_MS = 60_000;
+    const SCENE_TIMEOUT_MS = 40_000;
+    const RPC_TIMEOUT_MS = 45_000;
 
     // --- Pending village requests: conversationId → { actions, resolve } ---
     const pending = new Map();
