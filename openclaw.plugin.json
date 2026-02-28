@@ -1,5 +1,10 @@
 {
   "id": "village",
   "name": "Village",
-  "description": "Social village simulation — exposes /village endpoint and village tools for autonomous bot interactions"
+  "description": "Social village simulation — exposes /village endpoint and village tools for autonomous bot interactions",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
 }
