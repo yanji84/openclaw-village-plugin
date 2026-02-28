@@ -18,6 +18,38 @@
  */
 
 import { resolve, basename } from "node:path";
+import { generateKeyPairSync, createHash, createPrivateKey, sign } from "node:crypto";
+
+// --- Device identity for gateway RPC (operator.write scope requires signed device auth) ---
+
+function generateDeviceIdentity() {
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const publicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString();
+  const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  // Raw 32-byte public key from SPKI DER (last 32 bytes)
+  const spkiDer = publicKey.export({ type: "spki", format: "der" });
+  const raw = spkiDer.subarray(spkiDer.length - 32);
+  const deviceId = createHash("sha256").update(raw).digest("hex");
+  const publicKeyB64Url = raw.toString("base64url");
+  return { deviceId, publicKeyPem, privateKeyPem, publicKeyB64Url };
+}
+
+function signPayload(privateKeyPem, payload) {
+  const key = createPrivateKey(privateKeyPem);
+  return sign(null, Buffer.from(payload, "utf8"), key).toString("base64url");
+}
+
+function buildDeviceAuth({ deviceId, publicKeyB64Url, privateKeyPem, clientId, clientMode, role, scopes, token, nonce }) {
+  const signedAtMs = Date.now();
+  const payload = [
+    "v2", deviceId, clientId, clientMode, role, scopes.join(","),
+    String(signedAtMs), token || "", nonce,
+  ].join("|");
+  const signature = signPayload(privateKeyPem, payload);
+  return { id: deviceId, publicKey: publicKeyB64Url, signature, signedAt: signedAtMs, nonce };
+}
+
+const deviceIdentity = generateDeviceIdentity();
 
 /** @type {import('openclaw').OpenClawPluginDefinition} */
 export default {
@@ -76,13 +108,27 @@ export default {
       return new Promise((resolve, reject) => {
         const ws = new WebSocket(`ws://127.0.0.1:${port}`);
         let reqId = 0;
+        let connectSent = false;
         let connectResolved = false;
         const timeout = setTimeout(() => {
           ws.close();
           reject(new Error(`${method} WebSocket timeout (${timeoutMs / 1000}s)`));
         }, timeoutMs);
 
-        ws.addEventListener("open", () => {
+        function sendConnect(nonce) {
+          if (connectSent) return;
+          connectSent = true;
+          const device = buildDeviceAuth({
+            deviceId: deviceIdentity.deviceId,
+            publicKeyB64Url: deviceIdentity.publicKeyB64Url,
+            privateKeyPem: deviceIdentity.privateKeyPem,
+            clientId: "gateway-client",
+            clientMode: "backend",
+            role: "operator",
+            scopes: ["operator.write"],
+            token,
+            nonce,
+          });
           ws.send(JSON.stringify({
             type: "req",
             id: String(++reqId),
@@ -98,9 +144,12 @@ export default {
                 mode: "backend",
               },
               auth: { token },
+              role: "operator",
+              scopes: ["operator.write"],
+              device,
             },
           }));
-        });
+        }
 
         ws.addEventListener("message", (evt) => {
           let frame;
@@ -109,6 +158,12 @@ export default {
               typeof evt.data === "string" ? evt.data : evt.data.toString()
             );
           } catch {
+            return;
+          }
+
+          // Wait for connect.challenge, then send connect with the server's nonce
+          if (frame.type === "event" && frame.event === "connect.challenge") {
+            sendConnect(frame.payload?.nonce || "");
             return;
           }
 
@@ -229,9 +284,8 @@ export default {
           method: "agent",
           params: {
             message: scene,
-            to: conversationId,
-            channel: "village",
-            deliver: true,
+            sessionKey: conversationId,
+            deliver: false,
             idempotencyKey: `village-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           },
           timeoutMs: RPC_TIMEOUT_MS,
