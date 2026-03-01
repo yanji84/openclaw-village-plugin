@@ -887,14 +887,24 @@ export default {
       }
 
       async function joinAndPoll() {
-        // Join
+        // Join (retry up to 3 times)
         const { api: a } = remoteState;
         a.logger.info(`village: joining remote village at ${VILLAGE_HUB}`);
-        const { status, data } = await curlRequest("POST", "/api/village/join", {});
-        if (status >= 400 && status !== 409) {
-          throw new Error(data?.error || `join failed (${status})`);
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const { status, data } = await curlRequest("POST", "/api/village/join", {});
+          if (status >= 400 && status !== 409) {
+            throw new Error(data?.error || `join failed (${status})`);
+          }
+          if (data?.botName) {
+            remoteState.botName = data.botName;
+            break;
+          }
+          a.logger.warn(`village: join response missing botName (attempt ${attempt + 1}), retrying`);
+          await new Promise((r) => setTimeout(r, 2000));
         }
-        remoteState.botName = data.botName;
+        if (!remoteState.botName) {
+          throw new Error("join response never included botName");
+        }
         a.logger.info(`village: joined remote village as ${remoteState.botName}`);
 
         // Poll loop
