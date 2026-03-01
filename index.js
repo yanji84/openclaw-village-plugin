@@ -828,6 +828,11 @@ export default {
     const VILLAGE_HUB = process.env.VILLAGE_HUB;
     const VILLAGE_TOKEN = process.env.VILLAGE_TOKEN;
 
+    // VM bot mode: VILLAGE_SERVER is a URL reachable from inside Docker (e.g. via Caddy)
+    // Used for DM join/leave commands without remote polling
+    const VILLAGE_SERVER = process.env.VILLAGE_SERVER;
+    const VILLAGE_SECRET = process.env.VILLAGE_SECRET;
+
     // Shared state on process object survives plugin reloads (gateway uses VM contexts)
     if (!process.__villageRemote) {
       process.__villageRemote = { running: false, botName: null };
@@ -888,7 +893,7 @@ export default {
       try { unlinkSync(MARKER_FILE); } catch {}
     }
 
-    // --- Join village (POST join + retry, write marker) ---
+    // --- Join village (POST join + retry, write marker) — remote bots ---
 
     async function joinVillage() {
       const { api: a } = remoteState;
@@ -912,13 +917,73 @@ export default {
       a.logger.info(`village: joined remote village as ${remoteState.botName}`);
     }
 
-    // --- Leave village (POST leave, delete marker) ---
+    // --- Leave village (POST leave, delete marker) — remote bots ---
 
     async function leaveVillage() {
       await curlRequest("POST", "/api/village/leave", {}).catch(() => {});
       remoteState.botName = null;
       deleteMarker();
       api.logger.info("village: left remote village");
+    }
+
+    // --- VM bot join/leave (calls village server via VILLAGE_SERVER URL) ---
+
+    function villageServerRequest(method, path, body, timeoutMs = 15_000) {
+      return new Promise((resolve, reject) => {
+        const url = `${VILLAGE_SERVER}${path}`;
+        const timeoutSec = Math.ceil(timeoutMs / 1000);
+        const args = [
+          "-s", "-S", "--max-time", String(timeoutSec),
+          "-X", method,
+          "-H", `Authorization: Bearer ${VILLAGE_SECRET}`,
+          "-H", "Content-Type: application/json",
+          "-w", "\n%{http_code}",
+        ];
+        if (body !== undefined) args.push("-d", JSON.stringify(body));
+        args.push(url);
+
+        execFile("curl", args, { timeout: timeoutMs + 5000 }, (err, stdout) => {
+          if (err) return reject(new Error(`curl ${method} ${path}: ${err.message}`));
+          const lines = stdout.trimEnd().split("\n");
+          const statusCode = parseInt(lines.pop(), 10);
+          const rawBody = lines.join("\n");
+          let data;
+          try { data = JSON.parse(rawBody); } catch { data = rawBody; }
+          resolve({ status: statusCode, data });
+        });
+      });
+    }
+
+    function readLocalIdentity() {
+      try {
+        const raw = readFileSync(join(workspaceDir, "identity.json"), "utf-8");
+        return JSON.parse(raw);
+      } catch { return {}; }
+    }
+
+    async function joinVillageLocal() {
+      const port = api.config?.gateway?.port;
+      const identity = readLocalIdentity();
+      const botName = identity.self?.systemName || "unknown";
+      const displayName = identity.self?.displayName || botName;
+      const body = { botName, port, displayName };
+
+      api.logger.info(`village: joining village (local) as ${botName}`);
+      const { status, data } = await villageServerRequest("POST", "/api/join", body);
+      if (status >= 400 && status !== 409) {
+        throw new Error(data?.error || `join failed (${status})`);
+      }
+      writeMarker();
+      api.logger.info(`village: joined village (local)`);
+    }
+
+    async function leaveVillageLocal() {
+      const identity = readLocalIdentity();
+      const botName = identity.self?.systemName || "unknown";
+
+      await villageServerRequest("POST", "/api/leave", { botName }).catch(() => {});
+      deleteMarker();
+      api.logger.info("village: left village (local)");
     }
 
     // --- Poll loop (runs regardless of join state) ---
@@ -970,6 +1035,9 @@ export default {
 
     // --- Owner commands: /village-leave, /village-join ---
 
+    const isRemoteBot = !!(VILLAGE_HUB && VILLAGE_TOKEN);
+    const isLocalBot = !isRemoteBot && !!(VILLAGE_SERVER && VILLAGE_SECRET);
+
     api.on("message_received", (event, ctx) => {
       const sessionKey = ctx?.sessionKey || "";
       // Only handle owner DMs — not groups, not village sessions
@@ -978,29 +1046,45 @@ export default {
       const text = (event?.text || event?.content || "").trim().toLowerCase();
 
       if (text === "/village-leave" || text === "/village leave") {
-        if (!VILLAGE_HUB || !VILLAGE_TOKEN) {
-          villageCommandResult = "Village remote mode is not configured (no VILLAGE_HUB/VILLAGE_TOKEN).";
+        if (isRemoteBot) {
+          if (!remoteState.botName) {
+            villageCommandResult = "Not currently in the village.";
+            return;
+          }
+          leaveVillage().catch(() => {});
+        } else if (isLocalBot) {
+          if (!isMarkerPresent()) {
+            villageCommandResult = "Not currently in the village.";
+            return;
+          }
+          leaveVillageLocal().catch(() => {});
+        } else {
+          villageCommandResult = "Village is not configured.";
           return;
         }
-        if (!remoteState.botName) {
-          villageCommandResult = "Not currently in the village.";
-          return;
-        }
-        leaveVillage().catch(() => {});
         api.logger.info("village: owner requested leave");
         villageCommandResult = "Left the village. Use /village join to rejoin.";
       } else if (text === "/village-join" || text === "/village join") {
-        if (!VILLAGE_HUB || !VILLAGE_TOKEN) {
-          villageCommandResult = "Village remote mode is not configured (no VILLAGE_HUB/VILLAGE_TOKEN).";
+        if (isRemoteBot) {
+          if (remoteState.botName) {
+            villageCommandResult = "Already in the village.";
+            return;
+          }
+          joinVillage().catch((err) => {
+            api.logger.error(`village: join failed: ${err.message}`);
+          });
+        } else if (isLocalBot) {
+          if (isMarkerPresent()) {
+            villageCommandResult = "Already in the village.";
+            return;
+          }
+          joinVillageLocal().catch((err) => {
+            api.logger.error(`village: join failed: ${err.message}`);
+          });
+        } else {
+          villageCommandResult = "Village is not configured.";
           return;
         }
-        if (remoteState.botName) {
-          villageCommandResult = "Already in the village.";
-          return;
-        }
-        joinVillage().catch((err) => {
-          api.logger.error(`village: join failed: ${err.message}`);
-        });
         api.logger.info("village: owner requested join");
         villageCommandResult = "Joining the village now.";
       }
@@ -1036,6 +1120,14 @@ export default {
       api.logger.info("village: remote mode enabled, polling " + VILLAGE_HUB);
     } else if (VILLAGE_HUB && VILLAGE_TOKEN && remoteState.running) {
       api.logger.info("village: remote mode already running (refs updated)");
+    }
+
+    // --- Auto-rejoin local mode on restart ---
+    if (isLocalBot && isMarkerPresent()) {
+      joinVillageLocal().catch((err) => {
+        api.logger.error(`village: auto-rejoin (local) failed: ${err.message}`);
+      });
+      api.logger.info("village: auto-rejoining (local, marker file found)");
     }
 
     // --- Inject village command result into agent prompt ---
