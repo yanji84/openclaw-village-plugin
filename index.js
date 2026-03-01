@@ -17,7 +17,7 @@
  * guidance via before_prompt_build to prevent private info leakage.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, unlinkSync } from "node:fs";
 import { resolve, basename, join } from "node:path";
 import { generateKeyPairSync, createHash, createPrivateKey, sign } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -888,8 +888,24 @@ export default {
       });
     }
 
-    async function joinAndPoll() {
-      // Join (retry up to 3 times)
+    // --- Marker file for join/leave persistence across restarts ---
+    const MARKER_FILE = join(workspaceDir, ".village-active");
+
+    function isMarkerPresent() {
+      try { return existsSync(MARKER_FILE); } catch { return false; }
+    }
+
+    function writeMarker() {
+      try { writeFileSync(MARKER_FILE, new Date().toISOString() + "\n"); } catch {}
+    }
+
+    function deleteMarker() {
+      try { unlinkSync(MARKER_FILE); } catch {}
+    }
+
+    // --- Join village (POST join + retry, write marker) ---
+
+    async function joinVillage() {
       const { api: a } = remoteState;
       a.logger.info(`village: joining remote village at ${VILLAGE_HUB}`);
       for (let attempt = 0; attempt < 3; attempt++) {
@@ -907,10 +923,29 @@ export default {
       if (!remoteState.botName) {
         throw new Error("join response never included botName");
       }
+      writeMarker();
       a.logger.info(`village: joined remote village as ${remoteState.botName}`);
+    }
 
-      // Poll loop
+    // --- Leave village (POST leave, delete marker) ---
+
+    async function leaveVillage() {
+      await curlRequest("POST", "/api/village/leave", {}).catch(() => {});
+      remoteState.botName = null;
+      deleteMarker();
+      api.logger.info("village: left remote village");
+    }
+
+    // --- Poll loop (runs regardless of join state) ---
+
+    async function pollLoop() {
       while (remoteState.running) {
+        // Only poll when joined (botName is set)
+        if (!remoteState.botName) {
+          await new Promise((r) => setTimeout(r, BACKOFF_MS));
+          continue;
+        }
+
         try {
           const { status: ps, data: pd } = await curlRequest(
             "GET", `/api/village/poll/${remoteState.botName}`, undefined, POLL_TIMEOUT_MS
@@ -962,30 +997,27 @@ export default {
           villageCommandResult = "Village remote mode is not configured (no VILLAGE_HUB/VILLAGE_TOKEN).";
           return;
         }
-        if (!remoteState.running) {
-          villageCommandResult = "Already disconnected from the village.";
+        if (!remoteState.botName) {
+          villageCommandResult = "Not currently in the village.";
           return;
         }
-        remoteState.running = false;
-        curlRequest("POST", "/api/village/leave", {}).catch(() => {});
+        leaveVillage().catch(() => {});
         api.logger.info("village: owner requested leave");
-        villageCommandResult = "Disconnected from the village. Use /village-join to rejoin.";
+        villageCommandResult = "Left the village. Use /village join to rejoin.";
       } else if (text === "/village-join" || text === "/village join") {
         if (!VILLAGE_HUB || !VILLAGE_TOKEN) {
           villageCommandResult = "Village remote mode is not configured (no VILLAGE_HUB/VILLAGE_TOKEN).";
           return;
         }
-        if (remoteState.running) {
-          villageCommandResult = "Already connected to the village.";
+        if (remoteState.botName) {
+          villageCommandResult = "Already in the village.";
           return;
         }
-        remoteState.running = true;
-        joinAndPoll().catch((err) => {
-          remoteState.running = false;
-          api.logger.error(`village: rejoin failed: ${err.message}`);
+        joinVillage().catch((err) => {
+          api.logger.error(`village: join failed: ${err.message}`);
         });
         api.logger.info("village: owner requested join");
-        villageCommandResult = "Rejoining the village now.";
+        villageCommandResult = "Joining the village now.";
       }
     });
 
@@ -994,10 +1026,19 @@ export default {
     if (VILLAGE_HUB && VILLAGE_TOKEN && !remoteState.running) {
       remoteState.running = true;
 
-      joinAndPoll().catch((err) => {
+      // Always start the poll loop
+      pollLoop().catch((err) => {
         remoteState.running = false;
-        api.logger.error(`village: remote mode failed: ${err.message}`);
+        api.logger.error(`village: poll loop failed: ${err.message}`);
       });
+
+      // Auto-rejoin if marker file exists (bot was in village before restart)
+      if (isMarkerPresent()) {
+        joinVillage().catch((err) => {
+          api.logger.error(`village: auto-rejoin failed: ${err.message}`);
+        });
+        api.logger.info("village: auto-rejoining (marker file found)");
+      }
 
       // Graceful shutdown (register only once via remoteState guard)
       process.on("SIGTERM", () => {
