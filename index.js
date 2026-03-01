@@ -60,8 +60,6 @@ export default {
 
   activate(api) {
     // --- Constants ---
-    const VILLAGE_GAME = process.env.VILLAGE_GAME || "social-village";
-    const isSurvivalGame = VILLAGE_GAME === "survival";
 
     const SURVIVAL_TOOLS = new Set([
       "survival_move",
@@ -78,14 +76,10 @@ export default {
       "village_observe",
       "village_move",
     ]);
-    const VILLAGE_TOOLS = isSurvivalGame ? SURVIVAL_TOOLS : SOCIAL_TOOLS;
-    const ALLOWED_IN_VILLAGE = new Set([
-      ...VILLAGE_TOOLS,
-      "current_datetime",
-      "read",
-      "village_memory_search",
-    ]);
-    const MAX_ACTIONS_PER_TURN = isSurvivalGame ? 3 : 2;
+    const ALL_VILLAGE_TOOLS = new Set([...SOCIAL_TOOLS, ...SURVIVAL_TOOLS]);
+    function isSurvivalSession(sk) {
+      return typeof sk === "string" && sk.includes("survival:");
+    }
     const MAX_MESSAGE_LENGTH = 500;
     const SCENE_TIMEOUT_MS = 40_000;
     const RPC_TIMEOUT_MS = 45_000;
@@ -95,6 +89,8 @@ export default {
 
     // Track the last known village session key for tool execute fallback
     let lastVillageSessionKey = null;
+    // Track last game type for village_memory_search (set in before_tool_call)
+    let lastGameIsSurvival = false;
 
     // --- Helpers ---
 
@@ -523,7 +519,7 @@ export default {
           return { content: [{ type: "text", text: "Query is required." }] };
         }
 
-        const memoryFilename = isSurvivalGame ? "survival.md" : "village.md";
+        const memoryFilename = lastGameIsSurvival ? "survival.md" : "village.md";
         const villageMdPath = join(workspaceDir, "memory", memoryFilename);
         let content;
         try {
@@ -565,118 +561,116 @@ export default {
       },
     });
 
-    // --- Survival tool registrations (only when VILLAGE_GAME=survival) ---
+    // --- Survival tool registrations ---
 
-    if (isSurvivalGame) {
-      api.registerTool({
-        name: "survival_move",
-        description: "Move one tile in a direction. Uses your whole turn (exclusive action).",
-        parameters: {
-          type: "object",
-          properties: {
-            direction: {
-              type: "string",
-              enum: ["N", "S", "E", "W", "NE", "NW", "SE", "SW"],
-              description: "Direction to move",
-            },
+    api.registerTool({
+      name: "survival_move",
+      description: "Move one tile in a direction. Uses your whole turn (exclusive action).",
+      parameters: {
+        type: "object",
+        properties: {
+          direction: {
+            type: "string",
+            enum: ["N", "S", "E", "W", "NE", "NW", "SE", "SW"],
+            description: "Direction to move",
           },
-          required: ["direction"],
         },
-        async execute() {
-          return { content: [{ type: "text", text: "Moving." }] };
-        },
-      });
+        required: ["direction"],
+      },
+      async execute() {
+        return { content: [{ type: "text", text: "Moving." }] };
+      },
+    });
 
-      api.registerTool({
-        name: "survival_gather",
-        description: "Gather resources from your current tile. Picks up available resources into your inventory.",
-        parameters: { type: "object", properties: {} },
-        async execute() {
-          return { content: [{ type: "text", text: "Gathering resources." }] };
-        },
-      });
+    api.registerTool({
+      name: "survival_gather",
+      description: "Gather resources from your current tile. Picks up available resources into your inventory.",
+      parameters: { type: "object", properties: {} },
+      async execute() {
+        return { content: [{ type: "text", text: "Gathering resources." }] };
+      },
+    });
 
-      api.registerTool({
-        name: "survival_craft",
-        description: "Craft an item from materials in your inventory. Check available recipes in the ACTIONS section of your scene.",
-        parameters: {
-          type: "object",
-          properties: {
-            item: {
-              type: "string",
-              description: "Item to craft (e.g. wooden_pickaxe, stone_sword, iron_armor)",
-            },
+    api.registerTool({
+      name: "survival_craft",
+      description: "Craft an item from materials in your inventory. Check available recipes in the ACTIONS section of your scene.",
+      parameters: {
+        type: "object",
+        properties: {
+          item: {
+            type: "string",
+            description: "Item to craft (e.g. wooden_pickaxe, stone_sword, iron_armor)",
           },
-          required: ["item"],
         },
-        async execute() {
-          return { content: [{ type: "text", text: "Crafting item." }] };
-        },
-      });
+        required: ["item"],
+      },
+      async execute() {
+        return { content: [{ type: "text", text: "Crafting item." }] };
+      },
+    });
 
-      api.registerTool({
-        name: "survival_eat",
-        description: "Eat food from your inventory to reduce hunger.",
-        parameters: {
-          type: "object",
-          properties: {
-            item: {
-              type: "string",
-              description: "Food item to eat (e.g. berry)",
-            },
+    api.registerTool({
+      name: "survival_eat",
+      description: "Eat food from your inventory to reduce hunger.",
+      parameters: {
+        type: "object",
+        properties: {
+          item: {
+            type: "string",
+            description: "Food item to eat (e.g. berry)",
           },
-          required: ["item"],
         },
-        async execute() {
-          return { content: [{ type: "text", text: "Eating food." }] };
-        },
-      });
+        required: ["item"],
+      },
+      async execute() {
+        return { content: [{ type: "text", text: "Eating food." }] };
+      },
+    });
 
-      api.registerTool({
-        name: "survival_attack",
-        description: "Attack an adjacent bot (within 1 tile). Uses your whole turn (exclusive action). Damage depends on your weapon.",
-        parameters: {
-          type: "object",
-          properties: {
-            target: {
-              type: "string",
-              description: "System name of the bot to attack (must be within 1 tile)",
-            },
+    api.registerTool({
+      name: "survival_attack",
+      description: "Attack an adjacent bot (within 1 tile). Uses your whole turn (exclusive action). Damage depends on your weapon.",
+      parameters: {
+        type: "object",
+        properties: {
+          target: {
+            type: "string",
+            description: "System name of the bot to attack (must be within 1 tile)",
           },
-          required: ["target"],
         },
-        async execute() {
-          return { content: [{ type: "text", text: "Attacking." }] };
-        },
-      });
+        required: ["target"],
+      },
+      async execute() {
+        return { content: [{ type: "text", text: "Attacking." }] };
+      },
+    });
 
-      api.registerTool({
-        name: "survival_say",
-        description: "Say something to nearby survivors. Others within hearing range will see your message.",
-        parameters: {
-          type: "object",
-          properties: {
-            message: {
-              type: "string",
-              description: "What you want to say (max 500 characters)",
-            },
+    api.registerTool({
+      name: "survival_say",
+      description: "Say something to nearby survivors. Others within hearing range will see your message.",
+      parameters: {
+        type: "object",
+        properties: {
+          message: {
+            type: "string",
+            description: "What you want to say (max 500 characters)",
           },
-          required: ["message"],
         },
-        async execute() {
-          return { content: [{ type: "text", text: "Message sent." }] };
-        },
-      });
+        required: ["message"],
+      },
+      async execute() {
+        return { content: [{ type: "text", text: "Message sent." }] };
+      },
+    });
 
-      api.registerTool({
-        name: "survival_scout",
-        description: "Scout the surrounding area for extended visibility this turn. Uses your whole turn (exclusive action).",
-        parameters: { type: "object", properties: {} },
-        async execute() {
-          return { content: [{ type: "text", text: "Scouting area." }] };
-        },
-      });
-    }
+    api.registerTool({
+      name: "survival_scout",
+      description: "Scout the surrounding area for extended visibility this turn. Uses your whole turn (exclusive action).",
+      parameters: { type: "object", properties: {} },
+      async execute() {
+        return { content: [{ type: "text", text: "Scouting area." }] };
+      },
+    });
 
     // --- Hook: before_tool_call — enforce tool allowlist + capture actions ---
 
@@ -686,13 +680,17 @@ export default {
 
       if (isVillageSession(sessionKey)) {
         lastVillageSessionKey = sessionKey;
+        lastGameIsSurvival = isSurvivalSession(sessionKey);
+
+        const activeTools = lastGameIsSurvival ? SURVIVAL_TOOLS : SOCIAL_TOOLS;
+        const maxActions = lastGameIsSurvival ? 3 : 2;
 
         // Capture village tool calls into pending actions
-        if (VILLAGE_TOOLS.has(toolName)) {
+        if (activeTools.has(toolName)) {
           const nonce = extractConversationNonce(sessionKey);
           if (nonce) {
             const entry = pending.get(nonce);
-            if (entry && entry.actions.length < MAX_ACTIONS_PER_TURN) {
+            if (entry && entry.actions.length < maxActions) {
               const action = { tool: toolName, params: {} };
               // Social tools
               if (toolName === "village_say") {
@@ -727,7 +725,7 @@ export default {
           const filePath = event.params?.file_path || event.params?.path || event.params?.file || "";
           const resolved = resolve(filePath);
           const workspace = api.config?.agents?.defaults?.workspace || "/workspace";
-          const allowedFile = isSurvivalGame ? "survival.md" : "village.md";
+          const allowedFile = lastGameIsSurvival ? "survival.md" : "village.md";
           if (
             basename(resolved) === allowedFile &&
             resolved.startsWith(resolve(workspace) + "/")
@@ -747,7 +745,7 @@ export default {
         }
 
         // Block everything else in village sessions
-        const toolList = isSurvivalGame
+        const toolList = lastGameIsSurvival
           ? "survival_move, survival_gather, survival_craft, survival_eat, survival_attack, survival_say, survival_scout"
           : "village_say, village_whisper, village_observe, village_move";
         return {
@@ -757,8 +755,8 @@ export default {
         };
       }
 
-      // Normal session: block village tools
-      if (VILLAGE_TOOLS.has(toolName)) {
+      // Normal session: block all village/survival tools
+      if (ALL_VILLAGE_TOOLS.has(toolName)) {
         return {
           block: true,
           blockReason:
@@ -800,7 +798,7 @@ export default {
       if (!isVillageSession(sessionKey)) return;
       lastVillageSessionKey = sessionKey;
 
-      if (isSurvivalGame) {
+      if (isSurvivalSession(sessionKey)) {
         return {
           prependContext:
             "[SYSTEM] You are a survivor in a grid-based survival world.\n\n" +
