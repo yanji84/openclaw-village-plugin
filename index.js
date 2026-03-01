@@ -20,7 +20,7 @@
 import { readFileSync } from "node:fs";
 import { resolve, basename, join } from "node:path";
 import { generateKeyPairSync, createHash, createPrivateKey, sign } from "node:crypto";
-
+import { execFile } from "node:child_process";
 // --- Device identity for gateway RPC (operator.write scope requires signed device auth) ---
 
 function generateDeviceIdentity() {
@@ -109,8 +109,8 @@ export default {
     }
 
     function extractConversationNonce(sessionKey) {
-      // sessionKey: "agent:main:village:<loc>:tick-<N>" or "agent:main:survival:<bot>:tick-<N>"
-      // We need the "village:<loc>:tick-<N>" or "survival:<bot>:tick-<N>" part
+      // sessionKey: "agent:main:village:<bot>" or "agent:main:survival:<bot>"
+      // We need the "village:<bot>" or "survival:<bot>" part
       if (!sessionKey) return null;
       let idx = sessionKey.indexOf("village:");
       if (idx === -1) idx = sessionKey.indexOf("survival:");
@@ -523,7 +523,8 @@ export default {
           return { content: [{ type: "text", text: "Query is required." }] };
         }
 
-        const villageMdPath = join(workspaceDir, "memory", "village.md");
+        const memoryFilename = isSurvivalGame ? "survival.md" : "village.md";
+        const villageMdPath = join(workspaceDir, "memory", memoryFilename);
         let content;
         try {
           content = readFileSync(villageMdPath, "utf-8");
@@ -721,13 +722,14 @@ export default {
           return; // allow the tool call
         }
 
-        // Allow read only for village.md (strict basename + workspace boundary)
+        // Allow read only for the game's memory file (strict basename + workspace boundary)
         if (toolName === "read") {
           const filePath = event.params?.file_path || event.params?.path || event.params?.file || "";
           const resolved = resolve(filePath);
           const workspace = api.config?.agents?.defaults?.workspace || "/workspace";
+          const allowedFile = isSurvivalGame ? "survival.md" : "village.md";
           if (
-            basename(resolved) === "village.md" &&
+            basename(resolved) === allowedFile &&
             resolved.startsWith(resolve(workspace) + "/")
           ) {
             return; // allow
@@ -735,7 +737,7 @@ export default {
           return {
             block: true,
             blockReason:
-              "Only village.md in your workspace can be read during village sessions. Other files are not accessible here.",
+              `Only ${allowedFile} in your workspace can be read during village sessions. Other files are not accessible here.`,
           };
         }
 
@@ -839,103 +841,113 @@ export default {
     const VILLAGE_HUB = process.env.VILLAGE_HUB;
     const VILLAGE_TOKEN = process.env.VILLAGE_TOKEN;
 
-    if (VILLAGE_HUB && VILLAGE_TOKEN) {
-      let running = true;
-      let remoteBotName = null;
+    // Shared state on process object survives plugin reloads (gateway uses VM contexts)
+    if (!process.__villageRemote) {
+      process.__villageRemote = { running: false, botName: null };
+    }
+    const remoteState = process.__villageRemote;
+
+    // Update references on every reload so the poll loop uses the latest api/processScene
+    remoteState.api = api;
+    remoteState.processScene = processScene;
+
+    if (VILLAGE_HUB && VILLAGE_TOKEN && !remoteState.running) {
+      remoteState.running = true;
       const POLL_TIMEOUT_MS = 60_000;
       const BACKOFF_MS = 5_000;
 
-      const remoteHeaders = {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${VILLAGE_TOKEN}`,
-      };
+      function curlRequest(method, path, body, timeoutMs = 15_000) {
+        return new Promise((resolve, reject) => {
+          const url = `${VILLAGE_HUB}${path}`;
+          const timeoutSec = Math.ceil(timeoutMs / 1000);
+          const args = [
+            "-s", "-S", "--max-time", String(timeoutSec),
+            "-X", method,
+            "-H", `Authorization: Bearer ${VILLAGE_TOKEN}`,
+            "-H", "Content-Type: application/json",
+            "-w", "\n%{http_code}",
+          ];
+          if (body !== undefined) args.push("-d", JSON.stringify(body));
+          args.push(url);
 
-      async function joinRemoteVillage() {
-        const resp = await fetch(`${VILLAGE_HUB}/api/village/join`, {
-          method: "POST",
-          headers: remoteHeaders,
-          body: JSON.stringify({}),
-          signal: AbortSignal.timeout(15_000),
+          execFile("curl", args, { timeout: timeoutMs + 5000 }, (err, stdout, stderr) => {
+            if (err) return reject(new Error(`curl ${method} ${path}: ${err.message}`));
+            const lines = stdout.trimEnd().split("\n");
+            const statusCode = parseInt(lines.pop(), 10);
+            const rawBody = lines.join("\n");
+            let data;
+            try { data = JSON.parse(rawBody); } catch { data = rawBody; }
+            resolve({ status: statusCode, data });
+          });
         });
-        const data = await resp.json();
-        if (!resp.ok && resp.status !== 409) {
-          throw new Error(data.error || `join failed (${resp.status})`);
-        }
-        remoteBotName = data.botName;
-        api.logger.info(`village: joined remote village as ${remoteBotName}`);
       }
 
-      async function pollLoop() {
-        while (running) {
+      async function joinAndPoll() {
+        // Join
+        const { api: a } = remoteState;
+        a.logger.info(`village: joining remote village at ${VILLAGE_HUB}`);
+        const { status, data } = await curlRequest("POST", "/api/village/join", {});
+        if (status >= 400 && status !== 409) {
+          throw new Error(data?.error || `join failed (${status})`);
+        }
+        remoteState.botName = data.botName;
+        a.logger.info(`village: joined remote village as ${remoteState.botName}`);
+
+        // Poll loop
+        while (remoteState.running) {
           try {
-            const resp = await fetch(
-              `${VILLAGE_HUB}/api/village/poll/${remoteBotName}`,
-              {
-                headers: remoteHeaders,
-                signal: AbortSignal.timeout(POLL_TIMEOUT_MS),
-              }
+            const { status: ps, data: pd } = await curlRequest(
+              "GET", `/api/village/poll/${remoteState.botName}`, undefined, POLL_TIMEOUT_MS
             );
 
-            if (!running) break;
+            if (!remoteState.running) break;
+            if (ps === 204) continue;
 
-            if (resp.status === 204) continue; // no scene, re-poll
-
-            if (!resp.ok) {
-              api.logger.warn(`village: poll error ${resp.status}`);
+            if (ps >= 400) {
+              remoteState.api.logger.warn(`village: poll error ${ps}`);
               await new Promise((r) => setTimeout(r, BACKOFF_MS));
               continue;
             }
 
-            const { requestId, conversationId, scene } = await resp.json();
+            const { requestId, conversationId, scene } = pd;
 
             let result;
             try {
-              result = await processScene(conversationId, scene);
+              result = await remoteState.processScene(conversationId, scene);
             } catch (err) {
-              api.logger.warn(`village: processScene failed: ${err.message}`);
+              remoteState.api.logger.warn(`village: processScene failed: ${err.message}`);
               result = { actions: [{ tool: "village_observe", params: {} }] };
             }
 
-            // Send response back to the portal
             try {
-              await fetch(`${VILLAGE_HUB}/api/village/respond/${requestId}`, {
-                method: "POST",
-                headers: remoteHeaders,
-                body: JSON.stringify(result),
-                signal: AbortSignal.timeout(10_000),
-              });
+              await curlRequest("POST", `/api/village/respond/${requestId}`, result);
             } catch (err) {
-              api.logger.warn(`village: respond failed: ${err.message}`);
+              remoteState.api.logger.warn(`village: respond failed: ${err.message}`);
             }
           } catch (err) {
-            if (!running) break;
-            api.logger.warn(`village: poll loop error: ${err.message}`);
+            if (!remoteState.running) break;
+            remoteState.api.logger.warn(`village: poll loop error: ${err.message}`);
             await new Promise((r) => setTimeout(r, BACKOFF_MS));
           }
         }
       }
 
-      // Start remote mode
-      joinRemoteVillage()
-        .then(() => pollLoop())
-        .catch((err) => {
-          api.logger.error(`village: remote mode failed: ${err.message}`);
-        });
+      joinAndPoll().catch((err) => {
+        remoteState.running = false;
+        api.logger.error(`village: remote mode failed: ${err.message}`);
+      });
 
-      // Graceful shutdown
+      // Graceful shutdown (register only once via remoteState guard)
       process.on("SIGTERM", () => {
-        running = false;
-        if (remoteBotName) {
-          fetch(`${VILLAGE_HUB}/api/village/leave`, {
-            method: "POST",
-            headers: remoteHeaders,
-            body: JSON.stringify({}),
-            signal: AbortSignal.timeout(5_000),
-          }).catch(() => {});
+        remoteState.running = false;
+        if (remoteState.botName) {
+          curlRequest("POST", "/api/village/leave", {}).catch(() => {});
         }
       });
 
       api.logger.info("village: remote mode enabled, polling " + VILLAGE_HUB);
+    } else if (VILLAGE_HUB && VILLAGE_TOKEN && remoteState.running) {
+      api.logger.info("village: remote mode already running (refs updated)");
     }
 
     api.logger.info("village: plugin activated");
