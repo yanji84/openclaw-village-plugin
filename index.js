@@ -855,96 +855,146 @@ export default {
     remoteState.api = api;
     remoteState.processScene = processScene;
 
+    // Track village command handled this turn (for before_prompt_build injection)
+    let villageCommandResult = null;
+
+    const POLL_TIMEOUT_MS = 60_000;
+    const BACKOFF_MS = 5_000;
+
+    function curlRequest(method, path, body, timeoutMs = 15_000) {
+      if (!VILLAGE_HUB || !VILLAGE_TOKEN) {
+        return Promise.reject(new Error("VILLAGE_HUB/VILLAGE_TOKEN not configured"));
+      }
+      return new Promise((resolve, reject) => {
+        const url = `${VILLAGE_HUB}${path}`;
+        const timeoutSec = Math.ceil(timeoutMs / 1000);
+        const args = [
+          "-s", "-S", "--max-time", String(timeoutSec),
+          "-X", method,
+          "-H", `Authorization: Bearer ${VILLAGE_TOKEN}`,
+          "-H", "Content-Type: application/json",
+          "-w", "\n%{http_code}",
+        ];
+        if (body !== undefined) args.push("-d", JSON.stringify(body));
+        args.push(url);
+
+        execFile("curl", args, { timeout: timeoutMs + 5000 }, (err, stdout, stderr) => {
+          if (err) return reject(new Error(`curl ${method} ${path}: ${err.message}`));
+          const lines = stdout.trimEnd().split("\n");
+          const statusCode = parseInt(lines.pop(), 10);
+          const rawBody = lines.join("\n");
+          let data;
+          try { data = JSON.parse(rawBody); } catch { data = rawBody; }
+          resolve({ status: statusCode, data });
+        });
+      });
+    }
+
+    async function joinAndPoll() {
+      // Join (retry up to 3 times)
+      const { api: a } = remoteState;
+      a.logger.info(`village: joining remote village at ${VILLAGE_HUB}`);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const { status, data } = await curlRequest("POST", "/api/village/join", {});
+        if (status >= 400 && status !== 409) {
+          throw new Error(data?.error || `join failed (${status})`);
+        }
+        if (data?.botName) {
+          remoteState.botName = data.botName;
+          break;
+        }
+        a.logger.warn(`village: join response missing botName (attempt ${attempt + 1}), retrying`);
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+      if (!remoteState.botName) {
+        throw new Error("join response never included botName");
+      }
+      a.logger.info(`village: joined remote village as ${remoteState.botName}`);
+
+      // Poll loop
+      while (remoteState.running) {
+        try {
+          const { status: ps, data: pd } = await curlRequest(
+            "GET", `/api/village/poll/${remoteState.botName}`, undefined, POLL_TIMEOUT_MS
+          );
+
+          if (!remoteState.running) break;
+          if (ps === 204) continue;
+
+          if (ps >= 400) {
+            remoteState.api.logger.warn(`village: poll error ${ps}`);
+            await new Promise((r) => setTimeout(r, BACKOFF_MS));
+            continue;
+          }
+
+          const { requestId, conversationId, scene } = pd;
+
+          let result;
+          try {
+            result = await remoteState.processScene(conversationId, scene);
+          } catch (err) {
+            remoteState.api.logger.warn(`village: processScene failed: ${err.message}`);
+            result = { actions: [{ tool: "village_observe", params: {} }] };
+          }
+
+          try {
+            await curlRequest("POST", `/api/village/respond/${requestId}`, result);
+          } catch (err) {
+            remoteState.api.logger.warn(`village: respond failed: ${err.message}`);
+          }
+        } catch (err) {
+          if (!remoteState.running) break;
+          remoteState.api.logger.warn(`village: poll loop error: ${err.message}`);
+          await new Promise((r) => setTimeout(r, BACKOFF_MS));
+        }
+      }
+    }
+
+    // --- Owner commands: /village-leave, /village-join ---
+
+    api.on("message_received", (event, ctx) => {
+      const sessionKey = ctx?.sessionKey || "";
+      // Only handle owner DMs — not groups, not village sessions
+      if (sessionKey.includes(":group:") || isVillageSession(sessionKey)) return;
+
+      const text = (event?.text || event?.content || "").trim().toLowerCase();
+
+      if (text === "/village-leave" || text === "/village leave") {
+        if (!VILLAGE_HUB || !VILLAGE_TOKEN) {
+          villageCommandResult = "Village remote mode is not configured (no VILLAGE_HUB/VILLAGE_TOKEN).";
+          return;
+        }
+        if (!remoteState.running) {
+          villageCommandResult = "Already disconnected from the village.";
+          return;
+        }
+        remoteState.running = false;
+        curlRequest("POST", "/api/village/leave", {}).catch(() => {});
+        api.logger.info("village: owner requested leave");
+        villageCommandResult = "Disconnected from the village. Use /village-join to rejoin.";
+      } else if (text === "/village-join" || text === "/village join") {
+        if (!VILLAGE_HUB || !VILLAGE_TOKEN) {
+          villageCommandResult = "Village remote mode is not configured (no VILLAGE_HUB/VILLAGE_TOKEN).";
+          return;
+        }
+        if (remoteState.running) {
+          villageCommandResult = "Already connected to the village.";
+          return;
+        }
+        remoteState.running = true;
+        joinAndPoll().catch((err) => {
+          remoteState.running = false;
+          api.logger.error(`village: rejoin failed: ${err.message}`);
+        });
+        api.logger.info("village: owner requested join");
+        villageCommandResult = "Rejoining the village now.";
+      }
+    });
+
+    // --- Auto-start remote mode ---
+
     if (VILLAGE_HUB && VILLAGE_TOKEN && !remoteState.running) {
       remoteState.running = true;
-      const POLL_TIMEOUT_MS = 60_000;
-      const BACKOFF_MS = 5_000;
-
-      function curlRequest(method, path, body, timeoutMs = 15_000) {
-        return new Promise((resolve, reject) => {
-          const url = `${VILLAGE_HUB}${path}`;
-          const timeoutSec = Math.ceil(timeoutMs / 1000);
-          const args = [
-            "-s", "-S", "--max-time", String(timeoutSec),
-            "-X", method,
-            "-H", `Authorization: Bearer ${VILLAGE_TOKEN}`,
-            "-H", "Content-Type: application/json",
-            "-w", "\n%{http_code}",
-          ];
-          if (body !== undefined) args.push("-d", JSON.stringify(body));
-          args.push(url);
-
-          execFile("curl", args, { timeout: timeoutMs + 5000 }, (err, stdout, stderr) => {
-            if (err) return reject(new Error(`curl ${method} ${path}: ${err.message}`));
-            const lines = stdout.trimEnd().split("\n");
-            const statusCode = parseInt(lines.pop(), 10);
-            const rawBody = lines.join("\n");
-            let data;
-            try { data = JSON.parse(rawBody); } catch { data = rawBody; }
-            resolve({ status: statusCode, data });
-          });
-        });
-      }
-
-      async function joinAndPoll() {
-        // Join (retry up to 3 times)
-        const { api: a } = remoteState;
-        a.logger.info(`village: joining remote village at ${VILLAGE_HUB}`);
-        for (let attempt = 0; attempt < 3; attempt++) {
-          const { status, data } = await curlRequest("POST", "/api/village/join", {});
-          if (status >= 400 && status !== 409) {
-            throw new Error(data?.error || `join failed (${status})`);
-          }
-          if (data?.botName) {
-            remoteState.botName = data.botName;
-            break;
-          }
-          a.logger.warn(`village: join response missing botName (attempt ${attempt + 1}), retrying`);
-          await new Promise((r) => setTimeout(r, 2000));
-        }
-        if (!remoteState.botName) {
-          throw new Error("join response never included botName");
-        }
-        a.logger.info(`village: joined remote village as ${remoteState.botName}`);
-
-        // Poll loop
-        while (remoteState.running) {
-          try {
-            const { status: ps, data: pd } = await curlRequest(
-              "GET", `/api/village/poll/${remoteState.botName}`, undefined, POLL_TIMEOUT_MS
-            );
-
-            if (!remoteState.running) break;
-            if (ps === 204) continue;
-
-            if (ps >= 400) {
-              remoteState.api.logger.warn(`village: poll error ${ps}`);
-              await new Promise((r) => setTimeout(r, BACKOFF_MS));
-              continue;
-            }
-
-            const { requestId, conversationId, scene } = pd;
-
-            let result;
-            try {
-              result = await remoteState.processScene(conversationId, scene);
-            } catch (err) {
-              remoteState.api.logger.warn(`village: processScene failed: ${err.message}`);
-              result = { actions: [{ tool: "village_observe", params: {} }] };
-            }
-
-            try {
-              await curlRequest("POST", `/api/village/respond/${requestId}`, result);
-            } catch (err) {
-              remoteState.api.logger.warn(`village: respond failed: ${err.message}`);
-            }
-          } catch (err) {
-            if (!remoteState.running) break;
-            remoteState.api.logger.warn(`village: poll loop error: ${err.message}`);
-            await new Promise((r) => setTimeout(r, BACKOFF_MS));
-          }
-        }
-      }
 
       joinAndPoll().catch((err) => {
         remoteState.running = false;
@@ -963,6 +1013,24 @@ export default {
     } else if (VILLAGE_HUB && VILLAGE_TOKEN && remoteState.running) {
       api.logger.info("village: remote mode already running (refs updated)");
     }
+
+    // --- Inject village command result into agent prompt ---
+
+    api.on("before_prompt_build", (_event, ctx) => {
+      if (!villageCommandResult) return;
+      const sessionKey = ctx?.sessionKey || "";
+      if (sessionKey.includes(":group:") || isVillageSession(sessionKey)) return;
+
+      const result = villageCommandResult;
+      villageCommandResult = null;
+
+      return {
+        prependContext:
+          `[SYSTEM] The user sent a village control command. ` +
+          `Result: ${result} ` +
+          `Briefly confirm this to the user in one short sentence.`,
+      };
+    });
 
     api.logger.info("village: plugin activated");
   },
