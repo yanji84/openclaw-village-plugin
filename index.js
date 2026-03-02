@@ -280,9 +280,18 @@ export default {
 
     // --- HTTP endpoint: POST /village ---
 
+    // Remote bots use polling — disable the local /village endpoint
+    const isRemoteBotEarly = !!(process.env.VILLAGE_HUB && process.env.VILLAGE_TOKEN);
+
     api.registerHttpRoute({
       path: "/village",
       async handler(req, res) {
+        if (isRemoteBotEarly) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Not available in remote mode" }));
+          return;
+        }
+
         if (req.method !== "POST") {
           res.writeHead(405, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Method Not Allowed" }));
