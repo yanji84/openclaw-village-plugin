@@ -607,6 +607,10 @@ export default {
             type: "string",
             description: "Optional speech while executing directive",
           },
+          strategy: {
+            type: "string",
+            description: "Private strategy note — persists across ticks so you remember your multi-tick plan. Only you can see this. Example: 'Build iron sword, ally with weak bot, betray leader at tick 40'",
+          },
         },
         required: ["intent"],
       },
@@ -706,6 +710,7 @@ export default {
                 if (event.params?.x != null) action.params.x = Number(event.params.x);
                 if (event.params?.y != null) action.params.y = Number(event.params.y);
                 if (event.params?.message) action.params.message = sanitize(event.params.message);
+                if (event.params?.strategy) action.params.strategy = sanitize(event.params.strategy, 300);
               } else if (toolName === "survival_craft") {
                 action.params.item = sanitize(event.params?.item, 100);
               } else if (toolName === "survival_eat") {
