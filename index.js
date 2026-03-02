@@ -67,8 +67,10 @@ export default {
     const pending = new Map();              // conversationId → { actions, usage, resolve }
 
     const MAX_PARAM_LENGTH = 500;
-    let SCENE_TIMEOUT_MS = 40_000;
-    let RPC_TIMEOUT_MS = 45_000;
+    const DEFAULT_SCENE_TIMEOUT_MS = 40_000;
+    const DEFAULT_RPC_TIMEOUT_MS = 45_000;
+    let activeSceneTimeoutMs = DEFAULT_SCENE_TIMEOUT_MS;
+    let activeRpcTimeoutMs = DEFAULT_RPC_TIMEOUT_MS;
 
     // --- Security: tool name prefix allowlist ---
     const ALLOWED_PREFIXES = ["village_", "survival_", "game_", "dnd_"];
@@ -243,6 +245,8 @@ export default {
       activeSystemPrompt = payload.systemPrompt || null;
       activeAllowedReads = new Set(payload.allowedReads || []);
       activeMaxActions = payload.maxActions || 2;
+      activeSceneTimeoutMs = payload.sceneTimeoutMs || DEFAULT_SCENE_TIMEOUT_MS;
+      activeRpcTimeoutMs = payload.rpcTimeoutMs || DEFAULT_RPC_TIMEOUT_MS;
 
       // 3. Create pending entry for action capture
       let resolveEntry;
@@ -266,7 +270,7 @@ export default {
           deliver: false,
           idempotencyKey: `village-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         },
-        timeoutMs: RPC_TIMEOUT_MS,
+        timeoutMs: activeRpcTimeoutMs,
       }).catch((err) => {
         api.logger.warn(`village: agent RPC failed: ${err.message}`);
         const entry = pending.get(conversationId);
@@ -282,7 +286,7 @@ export default {
           entry.resolve(entry);
           pending.delete(conversationId);
         }
-      }, SCENE_TIMEOUT_MS);
+      }, activeSceneTimeoutMs);
 
       const entry = await entryPromise;
       clearTimeout(timer);
@@ -490,8 +494,8 @@ export default {
     function applyRemoteConfig(cfg) {
       if (!cfg) return;
       if (cfg.pollTimeoutMs) POLL_TIMEOUT_MS = cfg.pollTimeoutMs;
-      if (cfg.sceneTimeoutMs) SCENE_TIMEOUT_MS = cfg.sceneTimeoutMs;
-      if (cfg.rpcTimeoutMs) RPC_TIMEOUT_MS = cfg.rpcTimeoutMs;
+      if (cfg.sceneTimeoutMs) activeSceneTimeoutMs = cfg.sceneTimeoutMs;
+      if (cfg.rpcTimeoutMs) activeRpcTimeoutMs = cfg.rpcTimeoutMs;
       if (cfg.backoffMs) BACKOFF_MS = cfg.backoffMs;
     }
 
