@@ -9,7 +9,7 @@
  * v2 payload: { v, scene, tools, systemPrompt, allowedReads, maxActions }
  */
 
-import { readFileSync, existsSync, writeFileSync, unlinkSync, statSync, readdirSync } from "node:fs";
+import { readFileSync, statSync, readdirSync } from "node:fs";
 import { resolve, basename, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateKeyPairSync, createHash, createPrivateKey, sign } from "node:crypto";
@@ -518,21 +518,6 @@ export default {
       return { status: resp.status, data };
     }
 
-    // --- Marker file for join/leave persistence across restarts ---
-    const MARKER_FILE = join(workspaceDir, ".village-active");
-
-    function isMarkerPresent() {
-      try { return existsSync(MARKER_FILE); } catch { return false; }
-    }
-
-    function writeMarker() {
-      try { writeFileSync(MARKER_FILE, new Date().toISOString() + "\n"); } catch {}
-    }
-
-    function deleteMarker() {
-      try { unlinkSync(MARKER_FILE); } catch {}
-    }
-
     // --- Join/Leave village (remote bots) ---
 
     async function joinVillage() {
@@ -554,7 +539,6 @@ export default {
       if (!remoteState.botName) {
         throw new Error("join response never included botName");
       }
-      writeMarker();
       startPolling();
       remoteState.api.logger.info(`village: joined remote village as ${remoteState.botName}`);
     }
@@ -563,11 +547,11 @@ export default {
       stopPolling();
       await curlRequest("POST", "/api/village/leave", {}).catch(() => {});
       remoteState.botName = null;
-      deleteMarker();
       api.logger.info("village: left remote village");
     }
 
     // --- Join/Leave village (local/VM bots) ---
+    let localBotJoined = false;
 
     async function villageServerRequest(method, path, body, timeoutMs = 15_000) {
       const url = `${VILLAGE_SERVER}${path}`;
@@ -602,7 +586,7 @@ export default {
       if (status >= 400 && status !== 409) {
         throw new Error(data?.error || `join failed (${status})`);
       }
-      writeMarker();
+      localBotJoined = true;
       api.logger.info("village: joined village (local)");
     }
 
@@ -610,7 +594,7 @@ export default {
       const identity = readLocalIdentity();
       const botName = identity.self?.systemName || "unknown";
       await villageServerRequest("POST", "/api/leave", { botName }).catch(() => {});
-      deleteMarker();
+      localBotJoined = false;
       api.logger.info("village: left village (local)");
     }
 
@@ -765,7 +749,7 @@ export default {
           }
           leaveVillage().catch(() => {});
         } else if (isLocalBot) {
-          if (!isMarkerPresent()) {
+          if (!localBotJoined) {
             villageCommandResult = "Not currently in the village.";
             return;
           }
@@ -786,7 +770,7 @@ export default {
             api.logger.error(`village: join failed: ${err.message}`);
           });
         } else if (isLocalBot) {
-          if (isMarkerPresent()) {
+          if (localBotJoined) {
             villageCommandResult = "Already in the village.";
             return;
           }
@@ -825,10 +809,16 @@ export default {
     if (VILLAGE_HUB && VILLAGE_TOKEN && !remoteState.running) {
       remoteState.running = true;
 
+      // Startup handshake — check if bot was in game (server is source of truth)
       curlRequest("POST", "/api/village/hello", {}).then(({ status, data }) => {
         if (status === 200) {
           api.logger.info(`village: connected to hub (bot: ${data.botName}, game: ${data.game || "none"})`);
           curlRequest("POST", "/api/village/heartbeat", buildHeartbeat()).catch(() => {});
+          if (data.inGame && data.botName) {
+            remoteState.botName = data.botName;
+            startPolling();
+            api.logger.info("village: resuming (was in game)");
+          }
         } else {
           api.logger.error(`village: hub handshake failed (${status}): ${data?.error || "unknown error"}`);
         }
@@ -849,13 +839,6 @@ export default {
         remoteState.api.logger.warn(`village: heartbeat loop ended: ${err.message}`);
       });
 
-      if (isMarkerPresent()) {
-        joinVillage().catch((err) => {
-          api.logger.error(`village: auto-rejoin failed: ${err.message}`);
-        });
-        api.logger.info("village: auto-rejoining (marker file found)");
-      }
-
       process.on("SIGTERM", () => {
         remoteState.running = false;
         stopPolling();
@@ -869,12 +852,18 @@ export default {
       api.logger.info("village: remote mode already running (refs updated)");
     }
 
-    // Auto-rejoin local mode on restart
-    if (isLocalBot && isMarkerPresent()) {
-      joinVillageLocal().catch((err) => {
-        api.logger.error(`village: auto-rejoin (local) failed: ${err.message}`);
-      });
-      api.logger.info("village: auto-rejoining (local, marker file found)");
+    // Check if local bot was in game (server is source of truth)
+    if (isLocalBot) {
+      const identity = readLocalIdentity();
+      const botName = identity.self?.systemName;
+      if (botName) {
+        villageServerRequest("GET", `/api/bot/${botName}/status`).then(({ status, data }) => {
+          if (status === 200 && data?.inGame) {
+            localBotJoined = true;
+            api.logger.info("village: local bot is in game (server confirmed)");
+          }
+        }).catch(() => {});
+      }
     }
 
     api.logger.info("village: plugin activated (v2 protocol)");
