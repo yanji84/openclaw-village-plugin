@@ -623,54 +623,51 @@ export default {
       }
     }
 
+    function isTimeoutError(err) {
+      return err.name === "TimeoutError" || err.message?.includes("aborted");
+    }
+
+    async function backoff(isError) {
+      if (isError) {
+        metrics.pollErrors++;
+        await new Promise(r => setTimeout(r, BACKOFF_MS));
+      }
+    }
+
+    async function processSceneSafe(conversationId, payload) {
+      const t0 = Date.now();
+      try {
+        const result = await remoteState.processScene(conversationId, payload);
+        metrics.scenesProcessed++;
+        metrics.sceneTotalMs += (Date.now() - t0);
+        metrics.lastSceneAt = Date.now();
+        return result;
+      } catch (err) {
+        metrics.scenesFailed++;
+        metrics.sceneTotalMs += (Date.now() - t0);
+        remoteState.api.logger.warn(`village: processScene failed: ${err.message}`);
+        return { actions: [{ tool: "village_observe", params: {} }] };
+      }
+    }
+
     async function pollLoop(signal) {
       while (!signal.aborted) {
         try {
-          const { status: ps, data: pd } = await curlRequest(
+          const { status, data } = await curlRequest(
             "GET", `/api/village/poll/${remoteState.botName}`, undefined, POLL_TIMEOUT_MS
           );
 
           if (signal.aborted) return "stopped";
-          if (ps === 204) continue;
-          if (ps === 410) return "removed";
+          if (status === 410) return "removed";
+          if (status !== 200) { await backoff(status >= 400); continue; }
 
-          if (ps >= 400) {
-            metrics.pollErrors++;
-            remoteState.api.logger.warn(`village: poll error ${ps}`);
-            await new Promise((r) => setTimeout(r, BACKOFF_MS));
-            continue;
-          }
+          const { requestId, conversationId, ...v2Payload } = data;
+          const result = await processSceneSafe(conversationId, v2Payload);
+          await curlRequest("POST", `/api/village/respond/${requestId}`, result).catch(() => {});
 
-          // pd = { requestId, conversationId, scene, v?, tools?, systemPrompt?, ... }
-          const { requestId, conversationId, ...v2Payload } = pd;
-
-          let result;
-          const t0 = Date.now();
-          try {
-            result = await remoteState.processScene(conversationId, v2Payload);
-            metrics.scenesProcessed++;
-            metrics.sceneTotalMs += (Date.now() - t0);
-            metrics.lastSceneAt = Date.now();
-          } catch (err) {
-            metrics.scenesFailed++;
-            metrics.sceneTotalMs += (Date.now() - t0);
-            remoteState.api.logger.warn(`village: processScene failed: ${err.message}`);
-            result = { actions: [{ tool: "village_observe", params: {} }] };
-          }
-
-          try {
-            await curlRequest("POST", `/api/village/respond/${requestId}`, result);
-          } catch (err) {
-            remoteState.api.logger.warn(`village: respond failed: ${err.message}`);
-          }
         } catch (err) {
           if (signal.aborted) return "stopped";
-          if (err.name === "TimeoutError" || (err.message && err.message.includes("aborted"))) {
-            continue; // idle poll timeout — normal
-          }
-          metrics.pollErrors++;
-          remoteState.api.logger.warn(`village: poll loop error: ${err.message}`);
-          await new Promise((r) => setTimeout(r, BACKOFF_MS));
+          if (!isTimeoutError(err)) await backoff(true);
         }
       }
       return "stopped";
