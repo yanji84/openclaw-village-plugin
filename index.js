@@ -1086,7 +1086,7 @@ export default {
           return;
         }
         api.logger.info("village: owner requested join");
-        villageCommandResult = "Joining the village now.";
+        villageCommandResult = "Joining the village now.\nObserve: https://ggbot.it.com/village/";
       }
     });
 
