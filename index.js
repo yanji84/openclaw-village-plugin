@@ -17,9 +17,17 @@
  * guidance via before_prompt_build to prevent private info leakage.
  */
 
-import { readFileSync, existsSync, writeFileSync, unlinkSync } from "node:fs";
-import { resolve, basename, join } from "node:path";
+import { readFileSync, existsSync, writeFileSync, unlinkSync, statSync, readdirSync } from "node:fs";
+import { resolve, basename, join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { generateKeyPairSync, createHash, createPrivateKey, sign } from "node:crypto";
+
+// --- Plugin version ---
+let pluginVersion = "unknown";
+try {
+  const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "package.json");
+  pluginVersion = JSON.parse(readFileSync(pkgPath, "utf-8")).version;
+} catch {}
 // --- Device identity for gateway RPC (operator.write scope requires signed device auth) ---
 
 function generateDeviceIdentity() {
@@ -851,6 +859,19 @@ export default {
     remoteState.api = api;
     remoteState.processScene = processScene;
 
+    // --- Health metrics (survives poll loop iterations, reset on process restart) ---
+    if (!process.__villageMetrics) {
+      process.__villageMetrics = {
+        activatedAt: Date.now(),
+        scenesProcessed: 0,
+        scenesFailed: 0,
+        sceneTotalMs: 0,
+        lastSceneAt: null,
+        pollErrors: 0,
+      };
+    }
+    const metrics = process.__villageMetrics;
+
     // Track village command handled this turn (for before_prompt_build injection)
     let villageCommandResult = null;
 
@@ -995,6 +1016,7 @@ export default {
           if (ps === 204) continue;
 
           if (ps >= 400) {
+            metrics.pollErrors++;
             remoteState.api.logger.warn(`village: poll error ${ps}`);
             await new Promise((r) => setTimeout(r, BACKOFF_MS));
             continue;
@@ -1003,9 +1025,15 @@ export default {
           const { requestId, conversationId, scene } = pd;
 
           let result;
+          const t0 = Date.now();
           try {
             result = await remoteState.processScene(conversationId, scene);
+            metrics.scenesProcessed++;
+            metrics.sceneTotalMs += (Date.now() - t0);
+            metrics.lastSceneAt = Date.now();
           } catch (err) {
+            metrics.scenesFailed++;
+            metrics.sceneTotalMs += (Date.now() - t0);
             remoteState.api.logger.warn(`village: processScene failed: ${err.message}`);
             result = { actions: [{ tool: "village_observe", params: {} }] };
           }
@@ -1017,8 +1045,73 @@ export default {
           }
         } catch (err) {
           if (!remoteState.running) break;
+          metrics.pollErrors++;
           remoteState.api.logger.warn(`village: poll loop error: ${err.message}`);
           await new Promise((r) => setTimeout(r, BACKOFF_MS));
+        }
+      }
+    }
+
+    // --- Heartbeat: report health metrics to hub ---
+
+    const HEARTBEAT_INTERVAL_MS = 5 * 60_000;
+
+    function buildHeartbeat() {
+      const uptimeMs = Date.now() - metrics.activatedAt;
+      const avgSceneMs = metrics.scenesProcessed > 0
+        ? Math.round(metrics.sceneTotalMs / metrics.scenesProcessed)
+        : null;
+
+      // Memory file
+      let memoryFileSize = null;
+      const memoryFilename = lastGameIsSurvival ? "survival.md" : "village.md";
+      try {
+        const memPath = join(workspaceDir, "memory", memoryFilename);
+        if (existsSync(memPath)) memoryFileSize = statSync(memPath).size;
+      } catch {}
+
+      // Memory file count
+      let memoryFileCount = null;
+      try {
+        memoryFileCount = readdirSync(join(workspaceDir, "memory")).length;
+      } catch {}
+
+      // Session files
+      let sessionCount = null;
+      let sessionSizeBytes = null;
+      try {
+        const sessDir = join(workspaceDir, "..", ".openclaw", "agents", "main", "sessions");
+        const files = readdirSync(sessDir).filter(f => f.endsWith(".jsonl"));
+        sessionCount = files.length;
+        sessionSizeBytes = files.reduce((sum, f) => {
+          try { return sum + statSync(join(sessDir, f)).size; } catch { return sum; }
+        }, 0);
+      } catch {}
+
+      return {
+        version: pluginVersion,
+        uptimeMs,
+        joined: !!remoteState.botName,
+        scenesProcessed: metrics.scenesProcessed,
+        scenesFailed: metrics.scenesFailed,
+        avgSceneMs,
+        lastSceneAt: metrics.lastSceneAt,
+        pollErrors: metrics.pollErrors,
+        memoryFileSize,
+        memoryFileCount,
+        sessionCount,
+        sessionSizeBytes,
+      };
+    }
+
+    async function heartbeatLoop() {
+      while (remoteState.running) {
+        await new Promise((r) => setTimeout(r, HEARTBEAT_INTERVAL_MS));
+        if (!remoteState.running) break;
+        try {
+          await curlRequest("POST", "/api/village/heartbeat", buildHeartbeat());
+        } catch (err) {
+          remoteState.api.logger.warn(`village: heartbeat failed: ${err.message}`);
         }
       }
     }
@@ -1089,6 +1182,8 @@ export default {
       curlRequest("POST", "/api/village/hello", {}).then(({ status, data }) => {
         if (status === 200) {
           api.logger.info(`village: connected to hub (bot: ${data.botName}, game: ${data.game || "none"})`);
+          // Send initial heartbeat immediately
+          curlRequest("POST", "/api/village/heartbeat", buildHeartbeat()).catch(() => {});
         } else {
           api.logger.error(`village: hub handshake failed (${status}): ${data?.error || "unknown error"}`);
         }
@@ -1100,6 +1195,11 @@ export default {
       pollLoop().catch((err) => {
         remoteState.running = false;
         api.logger.error(`village: poll loop failed: ${err.message}`);
+      });
+
+      // Start heartbeat reporting
+      heartbeatLoop().catch((err) => {
+        remoteState.api.logger.warn(`village: heartbeat loop ended: ${err.message}`);
       });
 
       // Auto-rejoin if marker file exists (bot was in village before restart)
