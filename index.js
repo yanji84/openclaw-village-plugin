@@ -1191,6 +1191,16 @@ export default {
         api.logger.error(`village: hub unreachable: ${err.message}`);
       });
 
+      // Check for newer plugin version on npm
+      fetch("https://registry.npmjs.org/ggbot-village/latest", {
+        signal: AbortSignal.timeout(5_000),
+      }).then(r => r.json()).then(data => {
+        const latest = data.version;
+        if (latest && latest !== pluginVersion) {
+          api.logger.warn(`village: update available! v${pluginVersion} → v${latest}. Run: openclaw plugins install ggbot-village@${latest}`);
+        }
+      }).catch(() => {});
+
       // Always start the poll loop
       pollLoop().catch((err) => {
         remoteState.running = false;
