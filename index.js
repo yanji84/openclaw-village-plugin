@@ -493,9 +493,8 @@ export default {
 
     function applyRemoteConfig(cfg) {
       if (!cfg) return;
+      // Transport tuning only — scene/RPC timeouts come from v2 payload
       if (cfg.pollTimeoutMs) POLL_TIMEOUT_MS = cfg.pollTimeoutMs;
-      if (cfg.sceneTimeoutMs) activeSceneTimeoutMs = cfg.sceneTimeoutMs;
-      if (cfg.rpcTimeoutMs) activeRpcTimeoutMs = cfg.rpcTimeoutMs;
       if (cfg.backoffMs) BACKOFF_MS = cfg.backoffMs;
     }
 
