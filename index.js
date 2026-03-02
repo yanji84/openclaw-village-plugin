@@ -1095,6 +1095,17 @@ export default {
     if (VILLAGE_HUB && VILLAGE_TOKEN && !remoteState.running) {
       remoteState.running = true;
 
+      // Startup handshake — verify connection + token before anything else
+      curlRequest("POST", "/api/village/hello", {}).then(({ status, data }) => {
+        if (status === 200) {
+          api.logger.info(`village: connected to hub (bot: ${data.botName}, game: ${data.game || "none"})`);
+        } else {
+          api.logger.error(`village: hub handshake failed (${status}): ${data?.error || "unknown error"}`);
+        }
+      }).catch((err) => {
+        api.logger.error(`village: hub unreachable: ${err.message}`);
+      });
+
       // Always start the poll loop
       pollLoop().catch((err) => {
         remoteState.running = false;
