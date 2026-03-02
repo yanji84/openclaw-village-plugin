@@ -20,7 +20,6 @@
 import { readFileSync, existsSync, writeFileSync, unlinkSync } from "node:fs";
 import { resolve, basename, join } from "node:path";
 import { generateKeyPairSync, createHash, createPrivateKey, sign } from "node:crypto";
-import { execFile } from "node:child_process";
 // --- Device identity for gateway RPC (operator.write scope requires signed device auth) ---
 
 function generateDeviceIdentity() {
@@ -849,33 +848,24 @@ export default {
     const POLL_TIMEOUT_MS = 60_000;
     const BACKOFF_MS = 5_000;
 
-    function curlRequest(method, path, body, timeoutMs = 15_000) {
+    async function curlRequest(method, path, body, timeoutMs = 15_000) {
       if (!VILLAGE_HUB || !VILLAGE_TOKEN) {
-        return Promise.reject(new Error("VILLAGE_HUB/VILLAGE_TOKEN not configured"));
+        throw new Error("VILLAGE_HUB/VILLAGE_TOKEN not configured");
       }
-      return new Promise((resolve, reject) => {
-        const url = `${VILLAGE_HUB}${path}`;
-        const timeoutSec = Math.ceil(timeoutMs / 1000);
-        const args = [
-          "-s", "-S", "--max-time", String(timeoutSec),
-          "-X", method,
-          "-H", `Authorization: Bearer ${VILLAGE_TOKEN}`,
-          "-H", "Content-Type: application/json",
-          "-w", "\n%{http_code}",
-        ];
-        if (body !== undefined) args.push("-d", JSON.stringify(body));
-        args.push(url);
-
-        execFile("curl", args, { timeout: timeoutMs + 5000 }, (err, stdout, stderr) => {
-          if (err) return reject(new Error(`curl ${method} ${path}: ${err.message}`));
-          const lines = stdout.trimEnd().split("\n");
-          const statusCode = parseInt(lines.pop(), 10);
-          const rawBody = lines.join("\n");
-          let data;
-          try { data = JSON.parse(rawBody); } catch { data = rawBody; }
-          resolve({ status: statusCode, data });
-        });
-      });
+      const url = `${VILLAGE_HUB}${path}`;
+      const opts = {
+        method,
+        headers: {
+          "Authorization": `Bearer ${VILLAGE_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        signal: AbortSignal.timeout(timeoutMs),
+      };
+      if (body !== undefined) opts.body = JSON.stringify(body);
+      const resp = await fetch(url, opts);
+      let data;
+      try { data = await resp.json(); } catch { data = await resp.text().catch(() => ""); }
+      return { status: resp.status, data };
     }
 
     // --- Marker file for join/leave persistence across restarts ---
@@ -928,30 +918,21 @@ export default {
 
     // --- VM bot join/leave (calls village server via VILLAGE_SERVER URL) ---
 
-    function villageServerRequest(method, path, body, timeoutMs = 15_000) {
-      return new Promise((resolve, reject) => {
-        const url = `${VILLAGE_SERVER}${path}`;
-        const timeoutSec = Math.ceil(timeoutMs / 1000);
-        const args = [
-          "-s", "-S", "--max-time", String(timeoutSec),
-          "-X", method,
-          "-H", `Authorization: Bearer ${VILLAGE_SECRET}`,
-          "-H", "Content-Type: application/json",
-          "-w", "\n%{http_code}",
-        ];
-        if (body !== undefined) args.push("-d", JSON.stringify(body));
-        args.push(url);
-
-        execFile("curl", args, { timeout: timeoutMs + 5000 }, (err, stdout) => {
-          if (err) return reject(new Error(`curl ${method} ${path}: ${err.message}`));
-          const lines = stdout.trimEnd().split("\n");
-          const statusCode = parseInt(lines.pop(), 10);
-          const rawBody = lines.join("\n");
-          let data;
-          try { data = JSON.parse(rawBody); } catch { data = rawBody; }
-          resolve({ status: statusCode, data });
-        });
-      });
+    async function villageServerRequest(method, path, body, timeoutMs = 15_000) {
+      const url = `${VILLAGE_SERVER}${path}`;
+      const opts = {
+        method,
+        headers: {
+          "Authorization": `Bearer ${VILLAGE_SECRET}`,
+          "Content-Type": "application/json",
+        },
+        signal: AbortSignal.timeout(timeoutMs),
+      };
+      if (body !== undefined) opts.body = JSON.stringify(body);
+      const resp = await fetch(url, opts);
+      let data;
+      try { data = await resp.json(); } catch { data = await resp.text().catch(() => ""); }
+      return { status: resp.status, data };
     }
 
     function readLocalIdentity() {
