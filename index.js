@@ -10,7 +10,7 @@
  */
 
 import { readFileSync, statSync, readdirSync } from "node:fs";
-import { resolve, basename, join, dirname } from "node:path";
+import { resolve, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateKeyPairSync, createHash, createPrivateKey, sign } from "node:crypto";
 
@@ -305,71 +305,6 @@ export default {
       return result;
     }
 
-    // --- HTTP endpoint: POST /village (local mode only) ---
-
-    const isRemoteBotEarly = !!(process.env.VILLAGE_HUB && process.env.VILLAGE_TOKEN);
-
-    api.registerHttpRoute({
-      path: "/village",
-      async handler(req, res) {
-        if (isRemoteBotEarly) {
-          res.writeHead(404, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Not available in remote mode" }));
-          return;
-        }
-
-        if (req.method !== "POST") {
-          res.writeHead(405, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Method Not Allowed" }));
-          return;
-        }
-
-        const secret = process.env.VILLAGE_SECRET;
-        if (secret) {
-          if (req.headers.authorization !== `Bearer ${secret}`) {
-            res.writeHead(401, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Unauthorized" }));
-            return;
-          }
-        }
-
-        let body = "";
-        for await (const chunk of req) {
-          body += chunk;
-          if (body.length > 64 * 1024) {
-            res.writeHead(413, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Payload Too Large" }));
-            return;
-          }
-        }
-
-        let parsed;
-        try {
-          parsed = JSON.parse(body);
-        } catch {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Invalid JSON" }));
-          return;
-        }
-
-        const { conversationId, scene } = parsed;
-        if (!conversationId || !scene) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Missing conversationId or scene" }));
-          return;
-        }
-
-        try {
-          const result = await processScene(conversationId, parsed);
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(result));
-        } catch (err) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: err.message }));
-        }
-      },
-    });
-
     // --- Hook: before_tool_call — generic capture + enforce ---
 
     api.on("before_tool_call", (event, ctx) => {
@@ -465,8 +400,6 @@ export default {
 
     const VILLAGE_HUB = process.env.VILLAGE_HUB;
     const VILLAGE_TOKEN = process.env.VILLAGE_TOKEN;
-    const VILLAGE_SERVER = process.env.VILLAGE_SERVER;
-    const VILLAGE_SECRET = process.env.VILLAGE_SECRET;
 
     if (!process.__villageRemote) {
       process.__villageRemote = { running: false, botName: null, pollAbort: null };
@@ -498,7 +431,7 @@ export default {
       if (cfg.backoffMs) BACKOFF_MS = cfg.backoffMs;
     }
 
-    async function curlRequest(method, path, body, timeoutMs = 15_000) {
+    async function hubRequest(method, path, body, timeoutMs = 15_000) {
       if (!VILLAGE_HUB || !VILLAGE_TOKEN) {
         throw new Error("VILLAGE_HUB/VILLAGE_TOKEN not configured");
       }
@@ -524,7 +457,7 @@ export default {
       const { api: a } = remoteState;
       a.logger.info(`village: joining remote village at ${VILLAGE_HUB}`);
       for (let attempt = 0; attempt < 3; attempt++) {
-        const { status, data } = await curlRequest("POST", "/api/village/join", {});
+        const { status, data } = await hubRequest("POST", "/api/village/join", {});
         if (status >= 400 && status !== 409) {
           throw new Error(data?.error || `join failed (${status})`);
         }
@@ -545,57 +478,9 @@ export default {
 
     async function leaveVillage() {
       stopPolling();
-      await curlRequest("POST", "/api/village/leave", {}).catch(() => {});
+      await hubRequest("POST", "/api/village/leave", {}).catch(() => {});
       remoteState.botName = null;
       api.logger.info("village: left remote village");
-    }
-
-    // --- Join/Leave village (local/VM bots) ---
-    let localBotJoined = false;
-
-    async function villageServerRequest(method, path, body, timeoutMs = 15_000) {
-      const url = `${VILLAGE_SERVER}${path}`;
-      const opts = {
-        method,
-        headers: {
-          "Authorization": `Bearer ${VILLAGE_SECRET}`,
-          "Content-Type": "application/json",
-        },
-        signal: AbortSignal.timeout(timeoutMs),
-      };
-      if (body !== undefined) opts.body = JSON.stringify(body);
-      const resp = await fetch(url, opts);
-      let data;
-      try { data = await resp.json(); } catch { data = await resp.text().catch(() => ""); }
-      return { status: resp.status, data };
-    }
-
-    function readLocalIdentity() {
-      try {
-        return JSON.parse(readFileSync(join(workspaceDir, "identity.json"), "utf-8"));
-      } catch { return {}; }
-    }
-
-    async function joinVillageLocal() {
-      const port = api.config?.gateway?.port;
-      const identity = readLocalIdentity();
-      const botName = identity.self?.systemName || "unknown";
-      const displayName = identity.self?.displayName || botName;
-      api.logger.info(`village: joining village (local) as ${botName}`);
-      const { status, data } = await villageServerRequest("POST", "/api/join", { botName, port, displayName });
-      if (status >= 400 && status !== 409) {
-        throw new Error(data?.error || `join failed (${status})`);
-      }
-      localBotJoined = true;
-      api.logger.info("village: joined village (local)");
-    }
-
-    async function leaveVillageLocal() {
-      const identity = readLocalIdentity();
-      const botName = identity.self?.systemName || "unknown";
-      await villageServerRequest("POST", "/api/leave", { botName }).catch(() => {});
-      localBotJoined = false;
-      api.logger.info("village: left village (local)");
     }
 
     // --- Poll loop ---
@@ -653,7 +538,7 @@ export default {
     async function pollLoop(signal) {
       while (!signal.aborted) {
         try {
-          const { status, data } = await curlRequest(
+          const { status, data } = await hubRequest(
             "GET", `/api/village/poll/${remoteState.botName}`, undefined, POLL_TIMEOUT_MS
           );
 
@@ -663,7 +548,7 @@ export default {
 
           const { requestId, conversationId, ...v2Payload } = data;
           const result = await processSceneSafe(conversationId, v2Payload);
-          await curlRequest("POST", `/api/village/respond/${requestId}`, result).catch(() => {});
+          await hubRequest("POST", `/api/village/respond/${requestId}`, result).catch(() => {});
 
         } catch (err) {
           if (signal.aborted) return "stopped";
@@ -719,7 +604,7 @@ export default {
         await new Promise((r) => setTimeout(r, HEARTBEAT_INTERVAL_MS));
         if (!remoteState.running) break;
         try {
-          const { data: hbResp } = await curlRequest("POST", "/api/village/heartbeat", buildHeartbeat());
+          const { data: hbResp } = await hubRequest("POST", "/api/village/heartbeat", buildHeartbeat());
           applyRemoteConfig(hbResp?.config);
         } catch (err) {
           remoteState.api.logger.warn(`village: heartbeat failed: ${err.message}`);
@@ -729,9 +614,6 @@ export default {
 
     // --- Owner commands: /village-join, /village-leave ---
 
-    const isRemoteBot = !!(VILLAGE_HUB && VILLAGE_TOKEN);
-    const isLocalBot = !isRemoteBot && !!(VILLAGE_SERVER && VILLAGE_SECRET);
-
     api.on("message_received", (event, ctx) => {
       const sessionKey = ctx?.sessionKey || "";
       if (sessionKey.includes(":group:") || isVillageSession(sessionKey)) return;
@@ -739,45 +621,21 @@ export default {
       const text = (event?.text || event?.content || "").trim().toLowerCase();
 
       if (text === "/village-leave" || text === "/village leave") {
-        if (isRemoteBot) {
-          if (!remoteState.botName) {
-            villageCommandResult = "Not currently in the village.";
-            return;
-          }
-          leaveVillage().catch(() => {});
-        } else if (isLocalBot) {
-          if (!localBotJoined) {
-            villageCommandResult = "Not currently in the village.";
-            return;
-          }
-          leaveVillageLocal().catch(() => {});
-        } else {
-          villageCommandResult = "Village is not configured.";
+        if (!remoteState.botName) {
+          villageCommandResult = "Not currently in the village.";
           return;
         }
+        leaveVillage().catch(() => {});
         api.logger.info("village: owner requested leave");
         villageCommandResult = "Left the village. Use /village join to rejoin.";
       } else if (text === "/village-join" || text === "/village join") {
-        if (isRemoteBot) {
-          if (remoteState.botName) {
-            villageCommandResult = "Already in the village.";
-            return;
-          }
-          joinVillage().catch((err) => {
-            api.logger.error(`village: join failed: ${err.message}`);
-          });
-        } else if (isLocalBot) {
-          if (localBotJoined) {
-            villageCommandResult = "Already in the village.";
-            return;
-          }
-          joinVillageLocal().catch((err) => {
-            api.logger.error(`village: join failed: ${err.message}`);
-          });
-        } else {
-          villageCommandResult = "Village is not configured.";
+        if (remoteState.botName) {
+          villageCommandResult = "Already in the village.";
           return;
         }
+        joinVillage().catch((err) => {
+          api.logger.error(`village: join failed: ${err.message}`);
+        });
         api.logger.info("village: owner requested join");
         villageCommandResult = "Joining the village now.\nObserve: https://ggbot.it.com/village/";
       }
@@ -807,10 +665,10 @@ export default {
       remoteState.running = true;
 
       // Startup handshake — check if bot was in game (server is source of truth)
-      curlRequest("POST", "/api/village/hello", {}).then(({ status, data }) => {
+      hubRequest("POST", "/api/village/hello", {}).then(({ status, data }) => {
         if (status === 200) {
           api.logger.info(`village: connected to hub (bot: ${data.botName}, game: ${data.game || "none"})`);
-          curlRequest("POST", "/api/village/heartbeat", buildHeartbeat()).catch(() => {});
+          hubRequest("POST", "/api/village/heartbeat", buildHeartbeat()).catch(() => {});
           if (data.inGame && data.botName) {
             remoteState.botName = data.botName;
             startPolling();
@@ -840,27 +698,13 @@ export default {
         remoteState.running = false;
         stopPolling();
         if (remoteState.botName) {
-          curlRequest("POST", "/api/village/leave", {}).catch(() => {});
+          hubRequest("POST", "/api/village/leave", {}).catch(() => {});
         }
       });
 
       api.logger.info("village: remote mode enabled — " + VILLAGE_HUB);
     } else if (VILLAGE_HUB && VILLAGE_TOKEN && remoteState.running) {
       api.logger.info("village: remote mode already running (refs updated)");
-    }
-
-    // Check if local bot was in game (server is source of truth)
-    if (isLocalBot) {
-      const identity = readLocalIdentity();
-      const botName = identity.self?.systemName;
-      if (botName) {
-        villageServerRequest("GET", `/api/bot/${botName}/status`).then(({ status, data }) => {
-          if (status === 200 && data?.inGame) {
-            localBotJoined = true;
-            api.logger.info("village: local bot is in game (server confirmed)");
-          }
-        }).catch(() => {});
-      }
     }
 
     api.logger.info("village: plugin activated (v2 protocol)");
