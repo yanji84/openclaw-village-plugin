@@ -53,7 +53,7 @@ const deviceIdentity = generateDeviceIdentity();
 
 /** @type {import('openclaw').OpenClawPluginDefinition} */
 export default {
-  id: "village",
+  id: "ggbot-village",
   name: "Village",
   description: "Village game agent executor — v2 protocol",
 
