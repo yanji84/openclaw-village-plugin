@@ -665,21 +665,30 @@ export default {
       remoteState.running = true;
 
       // Startup handshake — check if bot was in game (server is source of truth)
-      hubRequest("POST", "/api/village/hello", {}).then(({ status, data }) => {
-        if (status === 200) {
-          api.logger.info(`village: connected to hub (bot: ${data.botName}, game: ${data.game || "none"})`);
-          hubRequest("POST", "/api/village/heartbeat", buildHeartbeat()).catch(() => {});
-          if (data.inGame && data.botName) {
-            remoteState.botName = data.botName;
-            startPolling();
-            api.logger.info("village: resuming (was in game)");
+      // Retries on failure (Docker containers may have slow DNS at boot)
+      (async () => {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const { status, data } = await hubRequest("POST", "/api/village/hello", {});
+            if (status === 200) {
+              api.logger.info(`village: connected to hub (bot: ${data.botName}, game: ${data.game || "none"})`);
+              hubRequest("POST", "/api/village/heartbeat", buildHeartbeat()).catch(() => {});
+              if (data.inGame && data.botName) {
+                remoteState.botName = data.botName;
+                startPolling();
+                api.logger.info("village: resuming (was in game)");
+              }
+              return;
+            }
+            api.logger.error(`village: hub handshake failed (${status}): ${data?.error || "unknown error"}`);
+            return;
+          } catch (err) {
+            api.logger.warn(`village: hub unreachable (attempt ${attempt + 1}/3): ${err.message}`);
+            if (attempt < 2) await new Promise(r => setTimeout(r, 5_000));
           }
-        } else {
-          api.logger.error(`village: hub handshake failed (${status}): ${data?.error || "unknown error"}`);
         }
-      }).catch((err) => {
-        api.logger.error(`village: hub unreachable: ${err.message}`);
-      });
+        api.logger.error("village: hub unreachable after 3 attempts");
+      })();
 
       fetch("https://registry.npmjs.org/ggbot-village/latest", {
         signal: AbortSignal.timeout(5_000),
