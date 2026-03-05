@@ -402,7 +402,7 @@ export default {
     const VILLAGE_TOKEN = process.env.VILLAGE_TOKEN;
 
     if (!process.__villageRemote) {
-      process.__villageRemote = { running: false, botName: null, pollAbort: null };
+      process.__villageRemote = { running: false, botName: null, pollAbort: null, hubConnected: false };
     }
     const remoteState = process.__villageRemote;
     remoteState.api = api;
@@ -416,9 +416,28 @@ export default {
         sceneTotalMs: 0,
         lastSceneAt: null,
         pollErrors: 0,
+        lastHeartbeatAt: null,
       };
     }
     const metrics = process.__villageMetrics;
+
+    const instanceId = Math.random().toString(36).slice(2, 10);
+
+    function formatUptime(ms) {
+      const s = Math.floor(ms / 1000);
+      const m = Math.floor(s / 60);
+      const h = Math.floor(m / 60);
+      if (h > 0) return `${h}h${m % 60}m`;
+      if (m > 0) return `${m}m${s % 60}s`;
+      return `${s}s`;
+    }
+
+    function getState() {
+      if (!remoteState.running) return 'OFFLINE';
+      if (!remoteState.hubConnected) return 'CONNECTING';
+      if (remoteState.botName) return 'IN_GAME';
+      return 'CONNECTED';
+    }
 
     let villageCommandResult = null;
     let POLL_TIMEOUT_MS = 125_000;
@@ -473,14 +492,14 @@ export default {
         throw new Error("join response never included botName");
       }
       startPolling();
-      remoteState.api.logger.info(`village: joined remote village as ${remoteState.botName}`);
+      remoteState.api.logger.info(`[village] state: CONNECTED → IN_GAME (bot: ${remoteState.botName})`);
     }
 
     async function leaveVillage() {
       stopPolling();
       await hubRequest("POST", "/api/village/leave", {}).catch(() => {});
       remoteState.botName = null;
-      api.logger.info("village: left remote village");
+      api.logger.info("[village] state: IN_GAME → CONNECTED (leave request)");
     }
 
     // --- Poll loop ---
@@ -492,8 +511,10 @@ export default {
 
       pollLoop(ac.signal).then((reason) => {
         if (remoteState.pollAbort === ac) remoteState.pollAbort = null;
-        if (reason === "removed") {
-          remoteState.api.logger.info("village: removed from game, rejoining...");
+        if (reason === "kicked") {
+          remoteState.api.logger.warn(`[village] state: IN_GAME → CONNECTED (kicked)`);
+        } else if (reason === "removed") {
+          remoteState.api.logger.info("[village] state: IN_GAME → CONNECTING (removed from game, rejoining...)");
           joinVillage().catch((err) => {
             remoteState.api.logger.error(`village: rejoin failed: ${err.message}`);
           });
@@ -593,6 +614,7 @@ export default {
 
       return {
         version: pluginVersion,
+        instanceId,
         uptimeMs,
         joined: !!remoteState.botName,
         scenesProcessed: metrics.scenesProcessed,
@@ -612,9 +634,36 @@ export default {
         if (!remoteState.running) break;
         try {
           const { data: hbResp } = await hubRequest("POST", "/api/village/heartbeat", buildHeartbeat());
+          metrics.lastHeartbeatAt = Date.now();
           applyRemoteConfig(hbResp?.config);
         } catch (err) {
           remoteState.api.logger.warn(`village: heartbeat failed: ${err.message}`);
+        }
+      }
+    }
+
+    // --- Health log loop (60s cadence) ---
+
+    const HEALTH_LOG_INTERVAL_MS = 60_000;
+
+    async function healthLogLoop() {
+      while (remoteState.running) {
+        await new Promise(r => setTimeout(r, HEALTH_LOG_INTERVAL_MS));
+        if (!remoteState.running) break;
+        const state = getState();
+        const uptime = formatUptime(Date.now() - metrics.activatedAt);
+        if (state === 'IN_GAME') {
+          const avgMs = metrics.scenesProcessed > 0
+            ? Math.round(metrics.sceneTotalMs / metrics.scenesProcessed)
+            : null;
+          api.logger.info(`[village] health: state=IN_GAME scenes=${metrics.scenesProcessed} errors=${metrics.pollErrors} avgScene=${avgMs}ms uptime=${uptime}`);
+        } else if (state === 'CONNECTED') {
+          const ago = metrics.lastHeartbeatAt
+            ? `${Math.round((Date.now() - metrics.lastHeartbeatAt) / 1000)}s ago`
+            : 'never';
+          api.logger.info(`[village] health: state=CONNECTED hub=ok lastHeartbeat=${ago} uptime=${uptime}`);
+        } else {
+          api.logger.info(`[village] health: state=${state} hub=UNREACHABLE uptime=${uptime}`);
         }
       }
     }
@@ -627,7 +676,11 @@ export default {
 
       const text = (event?.text || event?.content || "").trim().toLowerCase();
 
-      if (text === "/village-leave" || text === "/village leave") {
+      if (text === "/village status" || text === "/village-status") {
+        const state = getState();
+        const uptime = formatUptime(Date.now() - metrics.activatedAt);
+        villageCommandResult = `Village: ${state} | uptime=${uptime} | scenes=${metrics.scenesProcessed} errors=${metrics.pollErrors}`;
+      } else if (text === "/village-leave" || text === "/village leave") {
         if (!remoteState.botName) {
           villageCommandResult = "Not currently in the village.";
           return;
@@ -670,6 +723,8 @@ export default {
 
     if (VILLAGE_HUB && VILLAGE_TOKEN && !remoteState.running) {
       remoteState.running = true;
+      api.logger.info(`[village] instanceId=${instanceId}`);
+      api.logger.info(`[village] state: OFFLINE → CONNECTING (hub: ${VILLAGE_HUB})`);
 
       // Startup handshake — check if bot was in game (server is source of truth)
       // Retries on failure (Docker containers may have slow DNS at boot)
@@ -678,12 +733,13 @@ export default {
           try {
             const { status, data } = await hubRequest("POST", "/api/village/hello", {});
             if (status === 200) {
-              api.logger.info(`village: connected to hub (bot: ${data.botName}, game: ${data.game || "none"})`);
+              remoteState.hubConnected = true;
+              api.logger.info(`[village] state: CONNECTING → CONNECTED (hub: ${VILLAGE_HUB}, game: ${data.game || "none"})`);
               hubRequest("POST", "/api/village/heartbeat", buildHeartbeat()).catch(() => {});
               if (data.inGame && data.botName) {
                 remoteState.botName = data.botName;
                 startPolling();
-                api.logger.info("village: resuming (was in game)");
+                api.logger.info(`[village] state: CONNECTED → IN_GAME (resuming as ${data.botName})`);
               }
               return;
             }
@@ -694,7 +750,7 @@ export default {
             if (attempt < 2) await new Promise(r => setTimeout(r, 5_000));
           }
         }
-        api.logger.error("village: hub unreachable after 3 attempts");
+        api.logger.error("[village] state: CONNECTING → OFFLINE (hub unreachable after 3 attempts)");
       })();
 
       fetch("https://registry.npmjs.org/ggbot-village/latest", {
@@ -708,6 +764,10 @@ export default {
 
       heartbeatLoop().catch((err) => {
         remoteState.api.logger.warn(`village: heartbeat loop ended: ${err.message}`);
+      });
+
+      healthLogLoop().catch((err) => {
+        remoteState.api.logger.warn(`village: health log loop ended: ${err.message}`);
       });
 
       process.on("SIGTERM", () => {
