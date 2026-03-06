@@ -9,7 +9,7 @@
  * v2 payload: { v, scene, tools, systemPrompt, allowedReads, maxActions }
  */
 
-import { readFileSync, statSync, readdirSync } from "node:fs";
+import { readFileSync, appendFileSync, mkdirSync, statSync, readdirSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateKeyPairSync, createHash, createPrivateKey, sign } from "node:crypto";
@@ -64,6 +64,7 @@ export default {
     let activeSystemPrompt = null;          // injected via before_prompt_build
     let activeAllowedReads = new Set();     // workspace-relative paths the read tool may access
     let activeMaxActions = 2;
+    let activeJournalConfig = null;         // { maxLength, format } from server payload
     const pending = new Map();              // conversationId → { actions, usage, resolve }
 
     const MAX_PARAM_LENGTH = 500;
@@ -245,6 +246,7 @@ export default {
       activeSystemPrompt = payload.systemPrompt || null;
       activeAllowedReads = new Set(payload.allowedReads || []);
       activeMaxActions = payload.maxActions || 2;
+      activeJournalConfig = payload.journalConfig || null;
       activeSceneTimeoutMs = payload.sceneTimeoutMs || DEFAULT_SCENE_TIMEOUT_MS;
       activeRpcTimeoutMs = payload.rpcTimeoutMs || DEFAULT_RPC_TIMEOUT_MS;
 
@@ -312,6 +314,24 @@ export default {
       const toolName = event.name || event.toolName;
 
       if (isVillageSession(sessionKey)) {
+        // Journal: write to local filesystem, don't capture as server action
+        if (toolName === "village_journal") {
+          const cfg = activeJournalConfig || { maxLength: 500, format: "\n### {timestamp}\n{entry}\n" };
+          const text = sanitize(event.params?.entry || "", cfg.maxLength);
+          if (text) {
+            try {
+              const memDir = join(workspaceDir, "memory");
+              mkdirSync(memDir, { recursive: true });
+              const ts = new Date().toISOString().replace("T", " ").slice(0, 16);
+              const content = cfg.format.replace("{timestamp}", ts).replace("{entry}", text);
+              appendFileSync(join(memDir, "village.md"), content);
+            } catch (err) {
+              api.logger.warn(`village: journal write failed: ${err.message}`);
+            }
+          }
+          return; // allow (execute returns "OK"), not counted as action
+        }
+
         // Capture active tool calls into pending actions
         if (activeToolDefs.has(toolName)) {
           const nonce = extractConversationNonce(sessionKey);
