@@ -656,7 +656,7 @@ export default {
           const avgMs = metrics.scenesProcessed > 0
             ? Math.round(metrics.sceneTotalMs / metrics.scenesProcessed)
             : null;
-          api.logger.info(`[village] health: state=IN_GAME scenes=${metrics.scenesProcessed} errors=${metrics.pollErrors} avgScene=${avgMs}ms uptime=${uptime}`);
+          api.logger.info(`[village] health: state=IN_GAME scenes=${metrics.scenesProcessed} errors=${metrics.pollErrors} avgScene=${avgMs != null ? `${avgMs}ms` : '-'} uptime=${uptime}`);
         } else if (state === 'CONNECTED') {
           const ago = metrics.lastHeartbeatAt
             ? `${Math.round((Date.now() - metrics.lastHeartbeatAt) / 1000)}s ago`
