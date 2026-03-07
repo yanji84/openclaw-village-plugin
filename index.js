@@ -758,12 +758,6 @@ export default {
                 remoteState.botName = data.botName;
                 startPolling();
                 api.logger.info(`[village] state: CONNECTED → IN_GAME (resuming as ${data.botName})`);
-              } else if (data.shouldRejoin) {
-                // Server says we were previously joined — auto-rejoin
-                api.logger.info(`[village] state: CONNECTED → rejoining (server remoteParticipants)`);
-                joinVillage().catch((err) => {
-                  api.logger.error(`village: auto-rejoin failed: ${err.message}`);
-                });
               }
               return;
             }
