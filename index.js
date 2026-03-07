@@ -760,6 +760,12 @@ export default {
                 remoteState.botName = data.botName;
                 startPolling();
                 api.logger.info(`[village] state: CONNECTED → IN_GAME (resuming as ${data.botName})`);
+              } else {
+                // Auto-join: hub is reachable, no reason to stay idle
+                api.logger.info(`[village] state: CONNECTED → joining automatically...`);
+                joinVillage().catch((err) => {
+                  api.logger.error(`village: auto-join failed: ${err.message}`);
+                });
               }
               return;
             }

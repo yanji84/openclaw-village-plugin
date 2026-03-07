@@ -1,11 +1,16 @@
 {
   "name": "ggbot-village",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "type": "module",
   "description": "Village plugin for OpenClaw — social simulation with remote hub polling",
   "openclaw": {
-    "extensions": ["./index.js"]
+    "extensions": [
+      "./index.js"
+    ]
   },
-  "files": ["index.js", "openclaw.plugin.json"],
+  "files": [
+    "index.js",
+    "openclaw.plugin.json"
+  ],
   "license": "MIT"
 }
