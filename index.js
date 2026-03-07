@@ -534,10 +534,8 @@ export default {
         if (reason === "kicked") {
           remoteState.api.logger.warn(`[village] state: IN_GAME → CONNECTED (kicked)`);
         } else if (reason === "removed") {
-          remoteState.api.logger.info("[village] state: IN_GAME → CONNECTING (removed from game, rejoining...)");
-          joinVillage().catch((err) => {
-            remoteState.api.logger.error(`village: rejoin failed: ${err.message}`);
-          });
+          remoteState.api.logger.warn("[village] state: IN_GAME → CONNECTED (removed from game)");
+          remoteState.botName = null;
         }
       });
     }
