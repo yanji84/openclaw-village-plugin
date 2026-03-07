@@ -9,7 +9,7 @@
  * v2 payload: { v, scene, tools, systemPrompt, allowedReads, maxActions }
  */
 
-import { readFileSync, appendFileSync, mkdirSync, statSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, statSync, readdirSync, existsSync, unlinkSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateKeyPairSync, createHash, createPrivateKey, sign } from "node:crypto";
@@ -490,6 +490,12 @@ export default {
       return { status: resp.status, data };
     }
 
+    // --- Marker file for join persistence across restarts ---
+    const MARKER_FILE = join(workspaceDir, ".village-active");
+    function hasMarker() { try { return existsSync(MARKER_FILE); } catch { return false; } }
+    function writeMarker() { try { writeFileSync(MARKER_FILE, new Date().toISOString() + "\n"); } catch {} }
+    function deleteMarker() { try { unlinkSync(MARKER_FILE); } catch {} }
+
     // --- Join/Leave village (remote bots) ---
 
     async function joinVillage() {
@@ -511,12 +517,14 @@ export default {
       if (!remoteState.botName) {
         throw new Error("join response never included botName");
       }
+      writeMarker();
       startPolling();
       remoteState.api.logger.info(`[village] state: CONNECTED → IN_GAME (bot: ${remoteState.botName})`);
     }
 
     async function leaveVillage() {
       stopPolling();
+      deleteMarker();
       await hubRequest("POST", "/api/village/leave", {}).catch(() => {});
       remoteState.botName = null;
       api.logger.info("[village] state: IN_GAME → CONNECTED (leave request)");
@@ -760,11 +768,11 @@ export default {
                 remoteState.botName = data.botName;
                 startPolling();
                 api.logger.info(`[village] state: CONNECTED → IN_GAME (resuming as ${data.botName})`);
-              } else {
-                // Auto-join: hub is reachable, no reason to stay idle
-                api.logger.info(`[village] state: CONNECTED → joining automatically...`);
+              } else if (hasMarker()) {
+                // Owner previously joined — auto-rejoin after restart
+                api.logger.info(`[village] state: CONNECTED → rejoining (marker file found)`);
                 joinVillage().catch((err) => {
-                  api.logger.error(`village: auto-join failed: ${err.message}`);
+                  api.logger.error(`village: auto-rejoin failed: ${err.message}`);
                 });
               }
               return;
