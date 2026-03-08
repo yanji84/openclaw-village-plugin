@@ -605,13 +605,6 @@ export default {
           if (status === 410) return "removed";
           if (status !== 200) { await backoff(status >= 400); continue; }
 
-          // Poison pill: server kicked this bot
-          if (data.kick) {
-            remoteState.api.logger.info(`village: kicked by server: ${data.reason || "no reason"}`);
-            remoteState.botName = null;
-            return "kicked";
-          }
-
           const { requestId, conversationId, ...v2Payload } = data;
           const result = await processSceneSafe(conversationId, v2Payload);
           await hubRequest("POST", "/api/village/respond", { ...result, requestId }).catch(() => {});
