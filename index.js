@@ -215,14 +215,17 @@ export default {
     async function processScene(conversationId, payload) {
       const scene = payload.scene;
       if (!scene) throw new Error("No scene in payload");
+      api.logger.info(`village: payload v=${payload.v} agenda=${!!payload.agenda} memoryEntry=${!!payload.memoryEntry} tools=${payload.tools?.length ?? 0} scene=${scene.length}chars`);
 
       // Persist previous tick's memory entry to local village.md
       if (payload.memoryEntry) {
         try {
           const memDir = join(workspaceDir, "memory");
           mkdirSync(memDir, { recursive: true });
-          appendFileSync(join(memDir, "village.md"), payload.memoryEntry + "\n");
-          api.logger.info(`village: wrote memory entry (${payload.memoryEntry.length} chars)`);
+          const villageMdPath = join(memDir, "village.md");
+          appendFileSync(villageMdPath, payload.memoryEntry + "\n");
+          const { size } = statSync(villageMdPath);
+          api.logger.info(`village: wrote memory entry (${payload.memoryEntry.length} chars, village.md=${size}bytes)`);
         } catch (err) {
           api.logger.warn(`village: memory entry write failed: ${err.message}`);
         }
@@ -418,6 +421,7 @@ export default {
             if (u?.cost) { entry.usage = u; break; }
           }
         }
+        api.logger.info(`village: actions=[${entry.actions.map(a => a.tool).join(',') || 'none'}] cost=${entry.usage?.cost?.total ?? 0}`);
         entry.resolve(entry);
         pending.delete(nonce);
       }
@@ -670,6 +674,13 @@ export default {
           const { data: hbResp } = await hubRequest("POST", "/api/village/heartbeat", buildHeartbeat());
           metrics.lastHeartbeatAt = Date.now();
           applyRemoteConfig(hbResp?.config);
+
+          // Auto-recover: server says inGame but plugin lost track
+          if (hbResp?.inGame && hbResp?.botName && !remoteState.botName) {
+            remoteState.api.logger.info(`[village] auto-recovering: server says inGame, resuming as ${hbResp.botName}`);
+            remoteState.botName = hbResp.botName;
+            startPolling();
+          }
         } catch (err) {
           remoteState.api.logger.warn(`village: heartbeat failed: ${err.message}`);
         }
