@@ -826,6 +826,11 @@ export default {
           try {
             const { status, data } = await hubRequest("POST", "/api/village/hello", {});
             if (status === 200) {
+              if (data.duplicate) {
+                api.logger.info("[village] state: CONNECTING → OFFLINE (duplicate instance — standing down, original is still running)");
+                remoteState.running = false;
+                return;
+              }
               remoteState.hubConnected = true;
               api.logger.info(`[village] state: CONNECTING → CONNECTED (hub: ${VILLAGE_HUB}, game: ${data.game || "none"})`);
               hubRequest("POST", "/api/village/heartbeat", buildHeartbeat()).catch(() => {});
