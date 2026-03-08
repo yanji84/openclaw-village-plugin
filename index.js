@@ -614,7 +614,7 @@ export default {
 
           const { requestId, conversationId, ...v2Payload } = data;
           const result = await processSceneSafe(conversationId, v2Payload);
-          await hubRequest("POST", `/api/village/respond/${requestId}`, result).catch(() => {});
+          await hubRequest("POST", "/api/village/respond", { ...result, requestId }).catch(() => {});
 
         } catch (err) {
           if (signal.aborted) return "stopped";
@@ -819,12 +819,12 @@ export default {
       api.logger.info(`[village] instanceId=${instanceId}`);
       api.logger.info(`[village] state: OFFLINE → CONNECTING (hub: ${VILLAGE_HUB})`);
 
-      // Startup handshake — check if bot was in game (server is source of truth)
+      // Startup handshake — uses heartbeat with isHello:true for duplicate detection.
       // Retries on failure (Docker containers may have slow DNS at boot)
       (async () => {
         for (let attempt = 0; attempt < 3; attempt++) {
           try {
-            const { status, data } = await hubRequest("POST", "/api/village/hello", {});
+            const { status, data } = await hubRequest("POST", "/api/village/heartbeat", { ...buildHeartbeat(), isHello: true });
             if (status === 200) {
               if (data.duplicate) {
                 api.logger.info("[village] state: CONNECTING → OFFLINE (duplicate instance — standing down, original is still running)");
@@ -832,8 +832,7 @@ export default {
                 return;
               }
               remoteState.hubConnected = true;
-              api.logger.info(`[village] state: CONNECTING → CONNECTED (hub: ${VILLAGE_HUB}, game: ${data.game || "none"})`);
-              hubRequest("POST", "/api/village/heartbeat", buildHeartbeat()).catch(() => {});
+              api.logger.info(`[village] state: CONNECTING → CONNECTED (hub: ${VILLAGE_HUB})`);
               if (data.inGame && data.botName) {
                 remoteState.botName = data.botName;
                 startPolling();
