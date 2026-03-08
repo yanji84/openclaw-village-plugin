@@ -216,6 +216,20 @@ export default {
       const scene = payload.scene;
       if (!scene) throw new Error("No scene in payload");
 
+      // Persist previous tick's memory entry to local village.md
+      if (payload.memoryEntry) {
+        try {
+          const memDir = join(workspaceDir, "memory");
+          mkdirSync(memDir, { recursive: true });
+          appendFileSync(join(memDir, "village.md"), payload.memoryEntry + "\n");
+          api.logger.info(`village: wrote memory entry (${payload.memoryEntry.length} chars)`);
+        } catch (err) {
+          api.logger.warn(`village: memory entry write failed: ${err.message}`);
+        }
+      } else {
+        api.logger.info(`village: no memoryEntry in payload (keys: ${Object.keys(payload).join(",")})`);
+      }
+
       // 1. Update active tool definitions (used by factories + hooks)
       activeToolDefs.clear();
       for (const t of payload.tools || []) {
@@ -249,6 +263,7 @@ export default {
       activeJournalConfig = payload.journalConfig || null;
       activeSceneTimeoutMs = payload.sceneTimeoutMs || DEFAULT_SCENE_TIMEOUT_MS;
       activeRpcTimeoutMs = payload.rpcTimeoutMs || DEFAULT_RPC_TIMEOUT_MS;
+      if (payload.agenda !== undefined) cachedAgenda = payload.agenda;
 
       // 3. Create pending entry for action capture
       let resolveEntry;
@@ -460,6 +475,7 @@ export default {
     }
 
     let villageCommandResult = null;
+    let cachedAgenda = null; // locally cached agenda for sync GET
     let POLL_TIMEOUT_MS = 125_000;
     let BACKOFF_MS = 5_000;
 
@@ -686,6 +702,35 @@ export default {
       }
     }
 
+    // --- DM-only tool: set_village_agenda ---
+
+    api.registerTool((ctx) => {
+      const sk = ctx?.sessionKey || "";
+      // Only in DM sessions, not village/group
+      if (sk.includes(":group:") || isVillageSession(sk)) return null;
+      if (!remoteState.botName) return null;
+      return {
+        name: "set_village_agenda",
+        description: "Set your village agenda/goal based on what your owner tells you. Call this when your owner describes what they want you to focus on in the village.",
+        parameters: {
+          type: "object",
+          properties: {
+            goal: { type: "string", description: "The village agenda/goal, concise (max 100 chars)" },
+          },
+          required: ["goal"],
+        },
+        execute: async (_toolCallId, params) => {
+          const goal = (params?.goal || "").slice(0, 100).trim();
+          if (!goal) return { content: [{ type: "text", text: "No goal provided." }] };
+          cachedAgenda = goal;
+          hubRequest("POST", `/api/village/agenda/${remoteState.botName}`, { goal }).catch((err) => {
+            api.logger.warn(`village: set agenda failed: ${err.message}`);
+          });
+          return { content: [{ type: "text", text: `Village agenda set to: "${goal}"` }] };
+        },
+      };
+    }, { name: "set_village_agenda" });
+
     // --- Owner commands: /village-join, /village-leave ---
 
     api.on("message_received", (event, ctx) => {
@@ -698,6 +743,10 @@ export default {
         const state = getState();
         const uptime = formatUptime(Date.now() - metrics.activatedAt);
         villageCommandResult = `Village: ${state} | uptime=${uptime} | scenes=${metrics.scenesProcessed} errors=${metrics.pollErrors}`;
+      } else if (text === "/village agenda" || text === "/village-agenda") {
+        villageCommandResult = cachedAgenda
+          ? `Village agenda: "${cachedAgenda}"`
+          : `No village agenda set. Tell me what you want your bot to focus on in the village, and I'll set it as the agenda.`;
       } else if (text === "/village-leave" || text === "/village leave") {
         if (!remoteState.botName) {
           villageCommandResult = "Not currently in the village.";
@@ -722,19 +771,34 @@ export default {
     // --- Inject village command result into agent prompt ---
 
     api.on("before_prompt_build", (_event, ctx) => {
-      if (!villageCommandResult) return;
       const sessionKey = ctx?.sessionKey || "";
       if (sessionKey.includes(":group:") || isVillageSession(sessionKey)) return;
 
-      const result = villageCommandResult;
-      villageCommandResult = null;
+      // Village command result (e.g. /village agenda, /village status)
+      if (villageCommandResult) {
+        const result = villageCommandResult;
+        villageCommandResult = null;
+        return {
+          prependContext:
+            `[SYSTEM] The user sent a village control command. ` +
+            `Result: ${result} ` +
+            `Briefly confirm this to the user in one short sentence.`,
+        };
+      }
 
-      return {
-        prependContext:
-          `[SYSTEM] The user sent a village control command. ` +
-          `Result: ${result} ` +
-          `Briefly confirm this to the user in one short sentence.`,
-      };
+      // DM session with active village bot — inject agenda tool hint
+      if (remoteState.botName) {
+        const agendaPart = cachedAgenda
+          ? `Your current village agenda is: "${cachedAgenda}".`
+          : `You have no village agenda set yet.`;
+        return {
+          prependContext:
+            `[SYSTEM] You are participating in a village game. ${agendaPart} ` +
+            `If your owner tells you what to do or focus on in the village, ` +
+            `use the set_village_agenda tool to set it as your goal. ` +
+            `Do NOT just discuss it — actually call the tool.`,
+        };
+      }
     });
 
     // --- Auto-start remote mode ---
