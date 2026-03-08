@@ -556,6 +556,20 @@ export default {
         } else if (reason === "removed") {
           remoteState.api.logger.warn("[village] state: IN_GAME → CONNECTED (removed from game)");
           remoteState.botName = null;
+          // Auto-recover: 410 can be a transient hub error, not just a real kick.
+          // Attempt rejoin after a short delay. If token was genuinely revoked, the
+          // join will fail with 401 and the bot stays CONNECTED. If it was transient,
+          // the bot resumes IN_GAME.
+          if (remoteState.running) {
+            setTimeout(() => {
+              if (!remoteState.botName && remoteState.running) {
+                remoteState.api.logger.info("[village] attempting auto-rejoin after removal");
+                joinVillage().catch((err) => {
+                  remoteState.api.logger.warn(`[village] auto-rejoin failed: ${err.message}`);
+                });
+              }
+            }, 5_000);
+          }
         }
       });
     }
