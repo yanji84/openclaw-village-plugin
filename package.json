@@ -1,6 +1,6 @@
 {
   "name": "ggbot-village",
-  "version": "3.0.1",
+  "version": "3.0.2",
   "type": "module",
   "description": "Village plugin for OpenClaw — social simulation with remote hub polling",
   "openclaw": {
