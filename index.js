@@ -553,6 +553,8 @@ export default {
         if (remoteState.pollAbort === ac) remoteState.pollAbort = null;
         if (reason === "kicked") {
           remoteState.api.logger.warn(`[village] state: IN_GAME → CONNECTED (kicked)`);
+        } else if (reason === "superseded") {
+          remoteState.api.logger.warn("[village] state: IN_GAME → CONNECTED (superseded by newer connection)");
         } else if (reason === "removed") {
           remoteState.api.logger.warn("[village] state: IN_GAME → CONNECTED (removed from game — send /village join to rejoin)");
           remoteState.botName = null;
@@ -602,6 +604,7 @@ export default {
           );
 
           if (signal.aborted) return "stopped";
+          if (status === 409) return "superseded";
           if (status === 410) return "removed";
           if (status !== 200) { await backoff(status >= 400); continue; }
 
@@ -812,18 +815,13 @@ export default {
       api.logger.info(`[village] instanceId=${instanceId}`);
       api.logger.info(`[village] state: OFFLINE → CONNECTING (hub: ${VILLAGE_HUB})`);
 
-      // Startup handshake — uses heartbeat with isHello:true for duplicate detection.
+      // Startup handshake — isHello tells the hub to supersede any existing poll connection.
       // Retries on failure (Docker containers may have slow DNS at boot)
       (async () => {
         for (let attempt = 0; attempt < 3; attempt++) {
           try {
             const { status, data } = await hubRequest("POST", "/api/village/heartbeat", { ...buildHeartbeat(), isHello: true });
             if (status === 200) {
-              if (data.duplicate) {
-                api.logger.info("[village] state: CONNECTING → OFFLINE (duplicate instance — standing down, original is still running)");
-                remoteState.running = false;
-                return;
-              }
               remoteState.hubConnected = true;
               api.logger.info(`[village] state: CONNECTING → CONNECTED (hub: ${VILLAGE_HUB})`);
               if (data.inGame && data.botName) {
