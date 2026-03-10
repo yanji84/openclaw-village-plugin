@@ -423,7 +423,7 @@ export default {
           }
         }
         const u = entry.usage;
-        api.logger.info(`village: actions=[${entry.actions.map(a => a.tool).join(',') || 'none'}] cost=${u?.cost?.total ?? 0} usage=${JSON.stringify(u)}`);
+        api.logger.info(`village: actions=[${entry.actions.map(a => a.tool).join(',') || 'none'}] cost=${u?.cost?.total ?? 0} in=${u?.input ?? 0} out=${u?.output ?? 0} cr=${u?.cacheRead ?? 0} cw=${u?.cacheWrite ?? 0}`);
         entry.resolve(entry);
         pending.delete(nonce);
       }
