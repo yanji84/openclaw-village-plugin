@@ -9,7 +9,7 @@
  * v2 payload: { v, scene, tools, systemPrompt, allowedReads, maxActions }
  */
 
-import { readFileSync, appendFileSync, mkdirSync, statSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, statSync, readdirSync, existsSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateKeyPairSync, createHash, createPrivateKey, sign } from "node:crypto";
@@ -61,7 +61,7 @@ export default {
     // --- State ---
     const registeredTools = new Set();      // tool names with registered factories
     const activeToolDefs = new Map();       // name → { name, description, parameters } (current scene)
-    let activeSystemPrompt = null;          // injected via before_prompt_build
+    let activeSystemPrompt = null;          // injected via bootstrap hook
     let activeAllowedReads = new Set();     // workspace-relative paths the read tool may access
     let activeMaxActions = 2;
     let activeJournalConfig = null;         // { maxLength, format } from server payload
@@ -82,7 +82,7 @@ export default {
     // --- Helpers ---
 
     function isVillageSession(sessionKey) {
-      return typeof sessionKey === "string" && (sessionKey.includes("village:") || sessionKey.includes("survival:"));
+      return typeof sessionKey === "string" && (sessionKey.includes(":village:") || sessionKey.includes(":survival:"));
     }
 
     function sanitize(text, maxLen = MAX_PARAM_LENGTH) {
@@ -92,10 +92,10 @@ export default {
 
     function extractConversationNonce(sessionKey) {
       if (!sessionKey) return null;
-      let idx = sessionKey.indexOf("village:");
-      if (idx === -1) idx = sessionKey.indexOf("survival:");
+      let idx = sessionKey.indexOf(":village:");
+      if (idx === -1) idx = sessionKey.indexOf(":survival:");
       if (idx === -1) return null;
-      return sessionKey.slice(idx);
+      return sessionKey.slice(idx + 1); // skip leading colon → "village:wise-koala"
     }
 
     // --- Gateway RPC ---
@@ -259,8 +259,9 @@ export default {
         }
       }
 
-      // 3. Set active scene context
+      // 3. Set active scene context for bootstrap hook (globalThis IPC)
       activeSystemPrompt = payload.systemPrompt || null;
+      globalThis.__ggbot_village_prompt__ = activeSystemPrompt || "";
       activeAllowedReads = new Set(payload.allowedReads || []);
       activeMaxActions = payload.maxActions || 2;
       activeJournalConfig = payload.journalConfig || null;
@@ -421,19 +422,51 @@ export default {
             if (u?.cost) { entry.usage = u; break; }
           }
         }
-        api.logger.info(`village: actions=[${entry.actions.map(a => a.tool).join(',') || 'none'}] cost=${entry.usage?.cost?.total ?? 0}`);
+        const u = entry.usage;
+        api.logger.info(`village: actions=[${entry.actions.map(a => a.tool).join(',') || 'none'}] cost=${u?.cost?.total ?? 0} usage=${JSON.stringify(u)}`);
         entry.resolve(entry);
         pending.delete(nonce);
       }
     });
 
-    // --- Hook: before_prompt_build — inject active system prompt ---
-
-    api.on("before_prompt_build", (_event, ctx) => {
-      const sessionKey = ctx?.sessionKey;
-      if (!isVillageSession(sessionKey)) return;
-      if (activeSystemPrompt) return { prependContext: activeSystemPrompt };
-    });
+    // --- Deploy file-based agent:bootstrap hook to workspace ---
+    // Note: api.registerHook for internal hooks is wiped by clearInternalHooks()
+    // before loadInternalHooks() runs. File-based hooks survive because they are
+    // loaded from disk after the clear.
+    // IPC: plugin sets globalThis.__ggbot_village_prompt__, hook handler reads it.
+    // Same process/V8 isolate — no file I/O needed, cross-platform safe.
+    try {
+      const hooksDir = join(workspaceDir, "hooks", "village-bootstrap");
+      mkdirSync(hooksDir, { recursive: true });
+      const hookMd = `---
+name: village-bootstrap
+description: Strip bootstrap files for village sessions
+metadata:
+  openclaw:
+    events: ["agent:bootstrap"]
+---
+`;
+      const handlerJs = `export default async (event) => {
+  if (event.type !== "agent" || event.action !== "bootstrap") return;
+  // Colon-bounded check to avoid false positives on unrelated session keys
+  const sk = event.context?.sessionKey;
+  if (!sk || (!sk.includes(":village:") && !sk.includes(":survival:"))) return;
+  const prompt = globalThis.__ggbot_village_prompt__
+    || "You are in a village game. Respond with actions based on the scene.";
+  event.context.bootstrapFiles = [{
+    name: "AGENTS.md",
+    path: "village-bootstrap",
+    content: prompt,
+    missing: false
+  }];
+};
+`;
+      writeFileSync(join(hooksDir, "HOOK.md"), hookMd);
+      writeFileSync(join(hooksDir, "handler.js"), handlerJs);
+      api.logger.info("village: deployed bootstrap hook to workspace/hooks/village-bootstrap/");
+    } catch (err) {
+      api.logger.warn(`village: failed to deploy bootstrap hook: ${err.message}`);
+    }
 
     // --- Remote polling mode ---
 
@@ -622,7 +655,7 @@ export default {
 
     // --- Heartbeat ---
 
-    const HEARTBEAT_INTERVAL_MS = 5 * 60_000;
+    const HEARTBEAT_INTERVAL_MS = 60_000;
 
     function buildHeartbeat() {
       const uptimeMs = Date.now() - metrics.activatedAt;
@@ -651,6 +684,7 @@ export default {
         instanceId,
         uptimeMs,
         joined: !!remoteState.botName,
+        heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
         scenesProcessed: metrics.scenesProcessed,
         scenesFailed: metrics.scenesFailed,
         avgSceneMs,
