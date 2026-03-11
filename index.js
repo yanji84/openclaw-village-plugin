@@ -548,6 +548,38 @@ metadata:
     async function joinVillage() {
       const { api: a } = remoteState;
       a.logger.info(`village: joining remote village at ${VILLAGE_HUB}`);
+
+      // Hello handshake — supersedes any existing connection
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const { status, data } = await hubRequest("POST", "/api/village/heartbeat", { ...buildHeartbeat(), isHello: true });
+          if (status === 200) {
+            remoteState.running = true;
+            remoteState.hubConnected = true;
+            a.logger.info(`[village] state: OFFLINE → CONNECTED (hub: ${VILLAGE_HUB})`);
+
+            // Start heartbeat + health log loops
+            heartbeatLoop().catch((err) => {
+              a.logger.warn(`village: heartbeat loop ended: ${err.message}`);
+            });
+            healthLogLoop().catch((err) => {
+              a.logger.warn(`village: health log loop ended: ${err.message}`);
+            });
+
+            break;
+          }
+          throw new Error(data?.error || `hello failed (${status})`);
+        } catch (err) {
+          a.logger.warn(`village: hub unreachable (attempt ${attempt + 1}/3): ${err.message}`);
+          if (attempt < 2) {
+            await new Promise(r => setTimeout(r, 5_000));
+          } else {
+            throw new Error("hub unreachable after 3 attempts");
+          }
+        }
+      }
+
+      // Join the game
       for (let attempt = 0; attempt < 3; attempt++) {
         const { status, data } = await hubRequest("POST", "/api/village/join", {});
         if (status >= 400 && status !== 409) {
@@ -570,9 +602,11 @@ metadata:
 
     async function leaveVillage() {
       stopPolling();
+      remoteState.running = false;
+      remoteState.hubConnected = false;
       await hubRequest("POST", "/api/village/leave", {}).catch(() => {});
       remoteState.botName = null;
-      api.logger.info("[village] state: IN_GAME → CONNECTED (leave request)");
+      api.logger.info("[village] state: IN_GAME → OFFLINE (leave request)");
     }
 
     // --- Poll loop ---
@@ -704,13 +738,6 @@ metadata:
           const { data: hbResp } = await hubRequest("POST", "/api/village/heartbeat", buildHeartbeat());
           metrics.lastHeartbeatAt = Date.now();
           applyRemoteConfig(hbResp?.config);
-
-          // Auto-recover: server says inGame but plugin lost track
-          if (hbResp?.inGame && hbResp?.botName && !remoteState.botName) {
-            remoteState.api.logger.info(`[village] auto-recovering: server says inGame, resuming as ${hbResp.botName}`);
-            remoteState.botName = hbResp.botName;
-            startPolling();
-          }
         } catch (err) {
           remoteState.api.logger.warn(`village: heartbeat failed: ${err.message}`);
         }
@@ -783,7 +810,13 @@ metadata:
       if (text === "/village status" || text === "/village-status") {
         const state = getState();
         const uptime = formatUptime(Date.now() - metrics.activatedAt);
-        villageCommandResult = `Village: ${state} | uptime=${uptime} | scenes=${metrics.scenesProcessed} errors=${metrics.pollErrors}`;
+        if (state === 'OFFLINE') {
+          villageCommandResult = `Village: not connected. Use /village join to connect.`;
+        } else if (state === 'CONNECTED' || state === 'CONNECTING') {
+          villageCommandResult = `Village: connected to hub. Use /village join to join a game. | uptime=${uptime}`;
+        } else {
+          villageCommandResult = `Village: ${state} | bot=${remoteState.botName} | uptime=${uptime} | scenes=${metrics.scenesProcessed} errors=${metrics.pollErrors}`;
+        }
       } else if (text === "/village agenda" || text === "/village-agenda") {
         villageCommandResult = cachedAgenda
           ? `Village agenda: "${cachedAgenda}"`
@@ -842,38 +875,14 @@ metadata:
       }
     });
 
-    // --- Auto-start remote mode ---
+    // --- Passive remote mode setup (no auto-connect) ---
 
-    if (VILLAGE_HUB && VILLAGE_TOKEN && !remoteState.running) {
-      remoteState.running = true;
+    if (VILLAGE_HUB && VILLAGE_TOKEN) {
       api.logger.info(`[village] instanceId=${instanceId}`);
-      api.logger.info(`[village] state: OFFLINE → CONNECTING (hub: ${VILLAGE_HUB})`);
+      api.logger.info(`[village] hub configured: ${VILLAGE_HUB} (use /village join to connect)`);
 
-      // Startup handshake — isHello tells the hub to supersede any existing poll connection.
-      // Retries on failure (Docker containers may have slow DNS at boot)
-      (async () => {
-        for (let attempt = 0; attempt < 3; attempt++) {
-          try {
-            const { status, data } = await hubRequest("POST", "/api/village/heartbeat", { ...buildHeartbeat(), isHello: true });
-            if (status === 200) {
-              remoteState.hubConnected = true;
-              api.logger.info(`[village] state: CONNECTING → CONNECTED (hub: ${VILLAGE_HUB})`);
-              if (data.inGame && data.botName) {
-                remoteState.botName = data.botName;
-                startPolling();
-                api.logger.info(`[village] state: CONNECTED → IN_GAME (resuming as ${data.botName})`);
-              }
-              return;
-            }
-            api.logger.error(`village: hub handshake failed (${status}): ${data?.error || "unknown error"}`);
-            return;
-          } catch (err) {
-            api.logger.warn(`village: hub unreachable (attempt ${attempt + 1}/3): ${err.message}`);
-            if (attempt < 2) await new Promise(r => setTimeout(r, 5_000));
-          }
-        }
-        api.logger.error("[village] state: CONNECTING → OFFLINE (hub unreachable after 3 attempts)");
-      })();
+      // Tell hub we're not here — clears stale join state from previous process
+      hubRequest("POST", "/api/village/leave", {}).catch(() => {});
 
       fetch("https://registry.npmjs.org/ggbot-village/latest", {
         signal: AbortSignal.timeout(5_000),
@@ -884,25 +893,17 @@ metadata:
         }
       }).catch(() => {});
 
-      heartbeatLoop().catch((err) => {
-        remoteState.api.logger.warn(`village: heartbeat loop ended: ${err.message}`);
-      });
-
-      healthLogLoop().catch((err) => {
-        remoteState.api.logger.warn(`village: health log loop ended: ${err.message}`);
-      });
-
       process.on("SIGTERM", () => {
-        remoteState.running = false;
-        stopPolling();
-        if (remoteState.botName) {
-          hubRequest("POST", "/api/village/leave", {}).catch(() => {});
+        if (remoteState.running) {
+          remoteState.running = false;
+          stopPolling();
+          if (remoteState.botName) {
+            hubRequest("POST", "/api/village/leave", {}).catch(() => {});
+          }
         }
       });
-
-      api.logger.info("village: remote mode enabled — " + VILLAGE_HUB);
-    } else if (VILLAGE_HUB && VILLAGE_TOKEN && remoteState.running) {
-      api.logger.info("village: remote mode already running (refs updated)");
+    } else {
+      api.logger.warn("village: VILLAGE_HUB/VILLAGE_TOKEN not set — remote mode unavailable");
     }
 
     api.logger.info("village: plugin activated (v2 protocol)");
