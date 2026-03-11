@@ -11,6 +11,7 @@
 
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, statSync, readdirSync, existsSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { generateKeyPairSync, createHash, createPrivateKey, sign } from "node:crypto";
 
@@ -82,7 +83,10 @@ export default {
     // --- Helpers ---
 
     function isVillageSession(sessionKey) {
-      return typeof sessionKey === "string" && (sessionKey.includes(":village:") || sessionKey.includes(":survival:"));
+      if (typeof sessionKey !== "string") return false;
+      // Match both ":village:" (mid-key) and ":village" (end-of-key, e.g. "agent:main:plugin:village")
+      return sessionKey.includes(":village:") || sessionKey.endsWith(":village")
+          || sessionKey.includes(":survival:") || sessionKey.endsWith(":survival");
     }
 
     function sanitize(text, maxLen = MAX_PARAM_LENGTH) {
@@ -92,10 +96,17 @@ export default {
 
     function extractConversationNonce(sessionKey) {
       if (!sessionKey) return null;
+      // sessionKey format: "agent:main:<conversationId>"
+      // Extract everything after "agent:main:" (or first two colon-delimited segments)
+      const prefix = "agent:main:";
+      if (sessionKey.startsWith(prefix)) return sessionKey.slice(prefix.length);
+      // Fallback: look for :village or :survival
       let idx = sessionKey.indexOf(":village:");
+      if (idx === -1) idx = sessionKey.indexOf(":village");
       if (idx === -1) idx = sessionKey.indexOf(":survival:");
+      if (idx === -1) idx = sessionKey.indexOf(":survival");
       if (idx === -1) return null;
-      return sessionKey.slice(idx + 1); // skip leading colon → "village:wise-koala"
+      return sessionKey.slice(idx + 1);
     }
 
     // --- Gateway RPC ---
@@ -450,7 +461,7 @@ metadata:
   if (event.type !== "agent" || event.action !== "bootstrap") return;
   // Colon-bounded check to avoid false positives on unrelated session keys
   const sk = event.context?.sessionKey;
-  if (!sk || (!sk.includes(":village:") && !sk.includes(":survival:"))) return;
+  if (!sk || (!(sk.includes(":village:") || sk.endsWith(":village")) && !(sk.includes(":survival:") || sk.endsWith(":survival")))) return;
   const prompt = globalThis.__ggbot_village_prompt__
     || "You are in a village game. Respond with actions based on the scene.";
   event.context.bootstrapFiles = [{
@@ -675,8 +686,9 @@ metadata:
           if (status === 410) return "removed";
           if (status !== 200) { await backoff(status >= 400); continue; }
 
-          const { requestId, conversationId, ...v2Payload } = data;
-          const result = await processSceneSafe(conversationId, v2Payload);
+          const { requestId, conversationId: _locationId, ...v2Payload } = data;
+          const villageSessionId = "plugin:village";
+          const result = await processSceneSafe(villageSessionId, v2Payload);
           await hubRequest("POST", "/api/village/respond", { ...result, requestId }).catch(() => {});
 
         } catch (err) {
@@ -705,7 +717,7 @@ metadata:
       let sessionCount = null;
       let sessionSizeBytes = null;
       try {
-        const sessDir = join(workspaceDir, "..", ".openclaw", "agents", "main", "sessions");
+        const sessDir = join(process.env.HOME || process.env.USERPROFILE || homedir(), ".openclaw", "agents", "main", "sessions");
         const files = readdirSync(sessDir).filter(f => f.endsWith(".jsonl"));
         sessionCount = files.length;
         sessionSizeBytes = files.reduce((sum, f) => {
@@ -844,9 +856,19 @@ metadata:
 
     // --- Inject village command result into agent prompt ---
 
-    api.on("before_prompt_build", (_event, ctx) => {
+    api.on("before_prompt_build", (event, ctx) => {
       const sessionKey = ctx?.sessionKey || "";
-      if (sessionKey.includes(":group:") || isVillageSession(sessionKey)) return;
+
+      // Village sessions: clear message history so each tick gets clean context
+      if (isVillageSession(sessionKey)) {
+        if (Array.isArray(event?.messages) && event.messages.length > 0) {
+          api.logger.info(`[village] clearing ${event.messages.length} history messages for clean tick context`);
+          event.messages.splice(0);
+        }
+        return;
+      }
+
+      if (sessionKey.includes(":group:")) return;
 
       // Village command result (e.g. /village agenda, /village status)
       if (villageCommandResult) {
