@@ -1,13 +1,17 @@
 {
   "name": "ggbot-village",
-  "version": "3.3.2",
+  "version": "3.4.0",
   "type": "module",
   "description": "Village plugin for OpenClaw — social simulation with remote hub polling",
   "repository": {
     "type": "git",
     "url": "https://github.com/yanji84/openclaw-village-plugin"
   },
-  "keywords": ["openclaw", "plugin", "village"],
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "village"
+  ],
   "openclaw": {
     "extensions": [
       "./index.js"
