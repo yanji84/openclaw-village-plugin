@@ -3,6 +3,11 @@
   "version": "3.3.2",
   "type": "module",
   "description": "Village plugin for OpenClaw — social simulation with remote hub polling",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yanji84/openclaw-village-plugin"
+  },
+  "keywords": ["openclaw", "plugin", "village"],
   "openclaw": {
     "extensions": [
       "./index.js"
