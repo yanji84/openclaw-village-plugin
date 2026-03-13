@@ -9,7 +9,7 @@
  * v2 payload: { v, scene, tools, systemPrompt, allowedReads, maxActions }
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, watchFile, unwatchFile } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -29,6 +29,36 @@ try {
 } catch {}
 
 const deviceIdentity = generateDeviceIdentity();
+
+/**
+ * Parse an extension markdown file with YAML-like frontmatter.
+ * Format:
+ *   ---
+ *   tools:
+ *     - tool_name_a
+ *     - tool_name_b
+ *   ---
+ *   Prompt text for the LLM...
+ */
+function parseExtension(raw, filename) {
+  const match = raw.match(/^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/);
+  if (!match) return null;
+
+  const frontmatter = match[1];
+  const prompt = match[2].trim();
+
+  const tools = new Set();
+  const toolLines = frontmatter.match(/^\s*-\s+(.+)$/gm);
+  if (toolLines) {
+    for (const line of toolLines) {
+      const name = line.replace(/^\s*-\s+/, "").trim();
+      if (name) tools.add(name);
+    }
+  }
+
+  const name = filename.replace(/\.md$/, "");
+  return { name, tools, prompt };
+}
 
 /** @type {import('openclaw').OpenClawPluginDefinition} */
 export default {
@@ -83,6 +113,13 @@ export default {
       // Journal
       journalConfig: { maxLength: 500, format: "\n### {timestamp}\n{entry}\n" },
 
+      // Owner persona (loaded from workspace/village-persona.md)
+      ownerPersona: null,
+
+      // Local extensions (loaded from workspace/village-extensions/*.md)
+      extensions: [],          // [{ name, tools: Set, prompt: string }]
+      extensionTools: new Set(), // flattened set of all extension tool names
+
       // DM command state
       villageCommandResult: null,
       cachedAgenda: null,
@@ -103,6 +140,51 @@ export default {
     let hubClient;
     const { startPolling, stopPolling } = createPollLoop(ctx, (...args) => hubClient.hubRequest(...args));
     hubClient = createHubClient(ctx, { startPolling, stopPolling });
+
+    // --- Load owner persona ---
+    const personaPath = join(ctx.workspaceDir, "village-persona.md");
+    function loadPersona() {
+      try {
+        const text = readFileSync(personaPath, "utf-8").trim();
+        if (text) {
+          ctx.ownerPersona = text;
+          api.logger.info(`village: loaded owner persona (${text.length} chars)`);
+        } else {
+          ctx.ownerPersona = null;
+        }
+      } catch {
+        ctx.ownerPersona = null;
+      }
+    }
+    loadPersona();
+    watchFile(personaPath, { interval: 10_000 }, loadPersona);
+
+    // --- Load local extensions ---
+    const extensionsDir = join(ctx.workspaceDir, "village-extensions");
+    function loadExtensions() {
+      const exts = [];
+      const toolSet = new Set();
+      try {
+        const files = readdirSync(extensionsDir).filter(f => f.endsWith(".md"));
+        for (const file of files) {
+          try {
+            const raw = readFileSync(join(extensionsDir, file), "utf-8");
+            const ext = parseExtension(raw, file);
+            if (ext) {
+              exts.push(ext);
+              for (const t of ext.tools) toolSet.add(t);
+            }
+          } catch {}
+        }
+      } catch {}
+      ctx.extensions = exts;
+      ctx.extensionTools = toolSet;
+      if (exts.length > 0) {
+        api.logger.info(`village: loaded ${exts.length} extension(s): ${exts.map(e => e.name).join(", ")} (${toolSet.size} tools)`);
+      }
+    }
+    loadExtensions();
+    watchFile(extensionsDir, { interval: 10_000 }, loadExtensions);
 
     registerHooks(ctx);
     registerCommands(ctx, hubClient);
@@ -139,6 +221,8 @@ export default {
       if (!process.__villageSigtermRegistered) {
         process.__villageSigtermRegistered = true;
         process.on("SIGTERM", () => {
+          unwatchFile(personaPath);
+          unwatchFile(extensionsDir);
           const rs = process.__villageRemote;
           if (rs?.running) {
             rs.running = false;
