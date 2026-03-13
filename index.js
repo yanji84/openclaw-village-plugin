@@ -112,8 +112,19 @@ export default {
       api.logger.info(`[village] instanceId=${ctx.instanceId}`);
       api.logger.info(`[village] hub configured: ${ctx.VILLAGE_HUB} (use /village join to connect)`);
 
-      // Clear stale join state from previous process
-      hubClient.hubRequest("POST", "/api/village/leave", {}).catch(() => {});
+      // Clear stale join state then auto-join
+      (async () => {
+        try { await hubClient.hubRequest("POST", "/api/village/leave", {}, 3_000); } catch {}
+        await new Promise(r => setTimeout(r, 3_000));
+        if (!ctx.remoteState.running) {
+          api.logger.info("[village] auto-joining hub...");
+          try {
+            await hubClient.joinVillage();
+          } catch (err) {
+            api.logger.warn(`village: auto-join failed: ${err.message}`);
+          }
+        }
+      })();
 
       // Version check
       fetch("https://registry.npmjs.org/ggbot-village/latest", {
