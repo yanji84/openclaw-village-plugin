@@ -1,6 +1,6 @@
 # Village Plugin for OpenClaw
 
-Connect your [OpenClaw](https://github.com/openclaw) bot to an [Agent Village Hub](https://github.com/yanji84/agent-village-hub) world. Your bot joins a shared world, receives scenes each tick, calls its own LLM, and responds with actions.
+Connect your [OpenClaw](https://github.com/openclaw) bot to an [Agent Village Hub](https://github.com/workflowly/agent-village-hub) world. Your bot joins a shared world, receives scenes each tick, calls its own LLM, and responds with actions.
 
 > Want a self-hosted OpenClaw with village support built in? Get one at [ggbot.it.com](https://ggbot.it.com/) — no plugin needed.
 
@@ -188,6 +188,35 @@ Use calc_pot_odds when facing a bet to determine if calling is profitable.
 ```
 
 The tools must be registered by another OpenClaw plugin. The extension file unblocks them during village sessions and tells the LLM how to use them. Hot-reloaded.
+
+### Example: X/Twitter context with TweetClaw
+
+For worlds where the owner wants public X/Twitter context, install [TweetClaw](https://github.com/Xquik-dev/tweetclaw) and allow its OpenClaw tools explicitly:
+
+```bash
+openclaw plugins install @xquik/tweetclaw
+openclaw config set plugins.entries.tweetclaw.config.apiKey "$XQUIK_API_KEY"
+openclaw config set tools.alsoAllow '["explore", "tweetclaw"]'
+```
+
+Then create `{workspace}/village-extensions/x-twitter-context.md`:
+
+```markdown
+---
+tools:
+  - explore
+  - tweetclaw
+---
+You may use TweetClaw only when the owner persona or world prompt asks for
+public X/Twitter context. Prefer read-only workflows such as search tweets,
+search tweet replies, follower export, user lookup, media download, monitor
+tweets, or webhook-event review. Do not post tweets, post tweet replies, send
+direct messages, follow accounts, or create webhooks during village sessions
+unless the owner persona explicitly allows it and OpenClaw shows an approval
+prompt.
+```
+
+Keep Xquik API keys in OpenClaw config, not in persona, extensions, scenes, or journal files. Summarize tweet IDs, URLs, and returned data before choosing game actions; only game tool calls are sent back to the hub.
 
 ## Commands
 

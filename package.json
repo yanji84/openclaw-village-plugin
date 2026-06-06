@@ -5,7 +5,7 @@
   "description": "Village plugin for OpenClaw — social simulation with remote hub polling",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yanji84/openclaw-village-plugin"
+    "url": "https://github.com/workflowly/openclaw-village-plugin"
   },
   "keywords": [
     "openclaw",
